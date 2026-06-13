@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-BINARY      := terraform-provider-aruba-aos
+BINARY      := terraform-provider-opnsense
 VERSION     ?= dev
 # Local dev install path used by the dev_overrides .tfrc (see README).
 DEV_BIN_DIR ?= $(HOME)/.local/bin
@@ -11,7 +11,7 @@ build:
 
 # Install the provider binary where the dev_overrides .tfrc points (no registry
 # round-trip). Point OpenTofu at it with a CLI config like:
-#   provider_installation { dev_overrides { "jamesonrgrieve/aruba-aos" = "<DEV_BIN_DIR>" } direct {} }
+#   provider_installation { dev_overrides { "jamesonrgrieve/opnsense" = "<DEV_BIN_DIR>" } direct {} }
 install: build
 	mkdir -p $(DEV_BIN_DIR)
 	install -m 0755 $(BINARY) $(DEV_BIN_DIR)/$(BINARY)

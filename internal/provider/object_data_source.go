@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/JamesonRGrieve/tofu-opnsense/internal/opnsense"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -17,7 +18,7 @@ var (
 	_ datasource.DataSourceWithConfigure = (*objectDataSource)(nil)
 )
 
-// NewObjectDataSource constructs the generic aruba_aos_object data source.
+// NewObjectDataSource constructs the generic opnsense_object data source.
 func NewObjectDataSource() datasource.DataSource { return &objectDataSource{} }
 
 type objectDataSource struct {
@@ -35,15 +36,16 @@ func (d *objectDataSource) Metadata(_ context.Context, req datasource.MetadataRe
 
 func (d *objectDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Read any ArubaOS-Switch REST resource by its `/rest/v8` path.",
+		MarkdownDescription: "Read any OPNsense API GET command by its `/api` path.",
 		Attributes: map[string]schema.Attribute{
 			"path": schema.StringAttribute{
-				Required:            true,
-				MarkdownDescription: "Resource path under `/rest/v8` (leading slash optional), e.g. `vlans`, `system`, `vlans/40`.",
+				Required: true,
+				MarkdownDescription: "Command path under `/api` (leading slash optional), e.g. " +
+					"`firewall/alias/get`, `unbound/settings/get`, `firewall/alias/searchItem`.",
 			},
 			"response": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "The raw JSON response body from the switch.",
+				MarkdownDescription: "The raw JSON response body from the firewall.",
 			},
 		},
 	}
@@ -67,14 +69,18 @@ func (d *objectDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	raw, err := d.client.Get(normPath(m.Path.ValueString()))
+	p := strings.TrimSpace(m.Path.ValueString())
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	raw, err := d.client.Get(p)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
+		resp.Diagnostics.AddError("OPNsense read failed", err.Error())
 		return
 	}
 	compact, err := compactJSON(raw)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
+		resp.Diagnostics.AddError("OPNsense read: invalid JSON from device", err.Error())
 		return
 	}
 	m.Response = types.StringValue(compact)

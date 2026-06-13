@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Command aruba-aos is the OpenTofu/Terraform provider plugin entrypoint for
-// ArubaOS-Switch (AOS-S) switches via the REST API v8.
+// Command tofu-opnsense is the OpenTofu/Terraform provider plugin entrypoint
+// for OPNsense firewalls via the REST API.
 package main
 
 import (

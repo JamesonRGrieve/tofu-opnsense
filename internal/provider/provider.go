@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Package provider implements the aruba-aos OpenTofu/Terraform provider — a
-// native client for the ArubaOS-Switch (AOS-S) REST API v8. It is generic over
-// the API surface (the aruba_aos_object resource/data source address any
-// /rest/v8 path), giving 100% feature coverage without per-feature code.
+// Package provider implements the opnsense OpenTofu/Terraform provider — a
+// native client for the OPNsense REST API. It is generic over the API surface
+// (the opnsense_object resource/data source address any module/controller
+// command), giving full feature coverage without per-feature code.
 package provider
 
 import (
@@ -17,25 +17,25 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
-var _ provider.Provider = (*aosProvider)(nil)
+var _ provider.Provider = (*opnsenseProvider)(nil)
 
 // New returns the provider factory for a given version.
 func New(version string) func() provider.Provider {
-	return func() provider.Provider { return &aosProvider{version: version} }
+	return func() provider.Provider { return &opnsenseProvider{version: version} }
 }
 
-type aosProvider struct {
+type opnsenseProvider struct {
 	version string
 }
 
 type providerModel struct {
 	Host     types.String `tfsdk:"host"`
-	Username types.String `tfsdk:"username"`
-	Password types.String `tfsdk:"password"`
+	Key      types.String `tfsdk:"key"`
+	Secret   types.String `tfsdk:"secret"`
 	Insecure types.Bool   `tfsdk:"insecure"`
 }
 
-func (p *aosProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
+func (p *opnsenseProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
 	// Single-token type name -> resources are `opnsense_object`, so Terraform's
 	// prefix-before-first-underscore inference resolves the local name cleanly
 	// (the source address is still jamesonrgrieve/opnsense).
@@ -43,34 +43,34 @@ func (p *aosProvider) Metadata(_ context.Context, _ provider.MetadataRequest, re
 	resp.Version = p.version
 }
 
-func (p *aosProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
+func (p *opnsenseProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Native provider for ArubaOS-Switch (AOS-S) switches (2530/2920/2930F, 16.x) " +
-			"via the REST API v8. Not for ArubaOS-CX — use aruba/aoscx for those.",
+		MarkdownDescription: "Native provider for OPNsense firewalls via the REST API " +
+			"(`https://<host>/api`, HTTP Basic auth with an API key/secret).",
 		Attributes: map[string]schema.Attribute{
 			"host": schema.StringAttribute{
 				Required:            true,
-				MarkdownDescription: "Switch address (host or host:port), no scheme.",
+				MarkdownDescription: "OPNsense address (host or host:port), no scheme.",
 			},
-			"username": schema.StringAttribute{
+			"key": schema.StringAttribute{
 				Required:            true,
-				MarkdownDescription: "AOS-S operator/manager username.",
+				MarkdownDescription: "OPNsense API key (the Basic-auth username).",
 			},
-			"password": schema.StringAttribute{
+			"secret": schema.StringAttribute{
 				Required:            true,
 				Sensitive:           true,
-				MarkdownDescription: "AOS-S password.",
+				MarkdownDescription: "OPNsense API secret (the Basic-auth password).",
 			},
 			"insecure": schema.BoolAttribute{
 				Optional: true,
-				MarkdownDescription: "Skip TLS verification (default true — AOS-S ships a self-signed cert). " +
+				MarkdownDescription: "Skip TLS verification (default true — OPNsense ships a self-signed cert). " +
 					"Set false only with a trusted cert installed.",
 			},
 		},
 	}
 }
 
-func (p *aosProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+func (p *opnsenseProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
 	var cfg providerModel
 	resp.Diagnostics.Append(req.Config.Get(ctx, &cfg)...)
 	if resp.Diagnostics.HasError() {
@@ -82,18 +82,18 @@ func (p *aosProvider) Configure(ctx context.Context, req provider.ConfigureReque
 	}
 	client := opnsense.NewClient(opnsense.Config{
 		Host:     cfg.Host.ValueString(),
-		Username: cfg.Username.ValueString(),
-		Password: cfg.Password.ValueString(),
+		Key:      cfg.Key.ValueString(),
+		Secret:   cfg.Secret.ValueString(),
 		Insecure: insecure,
 	})
 	resp.ResourceData = client
 	resp.DataSourceData = client
 }
 
-func (p *aosProvider) Resources(_ context.Context) []func() resource.Resource {
+func (p *opnsenseProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{NewObjectResource}
 }
 
-func (p *aosProvider) DataSources(_ context.Context) []func() datasource.DataSource {
+func (p *opnsenseProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{NewObjectDataSource}
 }

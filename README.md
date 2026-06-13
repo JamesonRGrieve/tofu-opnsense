@@ -1,42 +1,48 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
-# terraform-provider-aruba-aos
+# terraform-provider-opnsense
 
-A native OpenTofu/Terraform provider for **ArubaOS-Switch (AOS-S)** switches —
-the ProVision/ProCurve-lineage 2530 / 2920 / 2930F running 16.x firmware — via
-the **REST API v8** (HTTPS, cookie-session auth).
-
-> **Not ArubaOS-CX.** The official `aruba/terraform-provider-aoscx` targets the
-> newer AOS-CX line (6300/8320/…) and does **not** manage AOS-S switches. AOS-S
-> has no upstream provider; this fills that gap. If you have a CX switch, use
-> the official one.
+A native OpenTofu/Terraform provider for **OPNsense** firewalls, driven entirely
+through the documented **REST API** (`https://<host>/api`, HTTP Basic auth with
+an API key/secret).
 
 ## Why generic
 
-AOS-S exposes a broad, stable REST surface (`/rest/v8/...`): singletons
-(`system`, `stp`, `dns`, `lldp`, `snmp-server`, `syslog`) and collections
-(`vlans/{vid}`, `vlans-ports/{vid}-{port}`, `ports/{id}`,
-`snmp-server/communities/{name}`, `stp/ports/{id}`, …). Rather than hand-code a
-resource per feature (and chase firmware additions forever), this provider is
-**generic over the API** — one resource and one data source address *any* path.
-That is **100% feature coverage** by construction.
+OPNsense exposes a broad, uniform RPC-style REST surface:
+`/api/<module>/<controller>/<command>[/<uuid>]`. Almost every model controller
+follows the same CRUD shape — `addItem`, `getItem/<uuid>`, `setItem/<uuid>`,
+`delItem/<uuid>` plus a per-module `service/reconfigure` apply — and settings
+controllers follow a `get`/`set` singleton shape. Rather than hand-code a
+resource per feature (and chase plugin additions forever), this provider is
+**generic over the API** — one resource and one data source address *any*
+module/controller. That is full feature coverage by construction.
 
 ## Resources
 
-### `arubaos_object` (resource)
+### `opnsense_object` (resource)
 
-CRUD + `ImportState` for any addressable AOS-S resource.
+CRUD + `ImportState` for any OPNsense model controller.
 
 ```hcl
-resource "arubaos_object" "vlan_iot" {
-  path        = "vlans/40"   # GET/PUT/DELETE target
-  create_path = "vlans"      # POST here on create (omit to create via PUT path)
-  body        = jsonencode({ vlan_id = 40, name = "IOT" })
+# Collection item (firewall alias): addItem / getItem / setItem / delItem.
+resource "opnsense_object" "lab_hosts" {
+  module      = "firewall"
+  controller  = "alias"
+  reconfigure = "firewall/alias/reconfigure"   # POSTed after every write
+  body = jsonencode({
+    name    = "lab_hosts"
+    type    = "host"
+    content = "10.0.0.1"
+    enabled = "1"
+  })
 }
 
-resource "arubaos_object" "system" {
-  path          = "system"
-  delete_method = "NONE"     # singleton — cannot be deleted
-  body          = jsonencode({ name = "house-aruba-2530" })
+# Settings singleton (Unbound general): get / set, no uuid, destroy is a no-op.
+resource "opnsense_object" "unbound" {
+  module      = "unbound"
+  controller  = "general"
+  singleton   = true
+  reconfigure = "unbound/service/reconfigure"
+  body        = jsonencode({ enabled = "1" })
 }
 ```
 
@@ -44,23 +50,30 @@ resource "arubaos_object" "system" {
 manage. State holds the full device object; a plan modifier suppresses the diff
 when every declared key already matches the device, so:
 
-- importing an existing resource (`tofu import` / `import {}` block) lands at
-  **0-diff** with no apply against the switch, and
+- importing an existing object (`tofu import` / `import {}` block) lands at
+  **0-diff** with no apply against the firewall, and
 - the provider never clobbers device fields you didn't declare.
 
 | Attribute | | Meaning |
 |-----------|---|---------|
-| `path` | required, ForceNew | addressed path under `/rest/v8` (leading slash optional) |
+| `module` | required, ForceNew | API module — first path segment under `/api` (`firewall`, `unbound`, …) |
+| `controller` | required, ForceNew | API controller; also the JSON envelope key wrapping `body` |
 | `body` | required | JSON object of the keys you manage |
-| `create_path` | optional, ForceNew | collection to `POST` to on create; omit → create via idempotent `PUT path` |
-| `delete_method` | optional | `DELETE` (default), `PUT` (send `delete_body` — reset a singleton), or `NONE` |
-| `delete_body` | optional | reset body for `delete_method = "PUT"` |
-| `id` | computed | equals `path` |
+| `singleton` | optional (default `false`), ForceNew | `true` → settings `get`/`set` (no uuid); `false` → collection `addItem`/`getItem`/`setItem`/`delItem` |
+| `reconfigure` | optional | command path POSTed after every write to apply (e.g. `firewall/alias/reconfigure`) |
+| `uuid` | computed | server-assigned UUID of a collection item (empty for a singleton) |
+| `id` | computed | `<module>/<controller>` (singleton) or `<module>/<controller>/<uuid>` (item) |
 
-### `arubaos_object` (data source)
+**Import id**: `<module>/<controller>/<uuid>` for a collection item,
+`<module>/<controller>` for a singleton; append `|<reconfigure>` to carry the
+apply command into imported state. Examples:
+`firewall/alias/<uuid>|firewall/alias/reconfigure`,
+`unbound/general|unbound/service/reconfigure`.
+
+### `opnsense_object` (data source)
 
 ```hcl
-data "arubaos_object" "vlans" { path = "vlans" }   # .response is raw JSON
+data "opnsense_object" "aliases" { path = "firewall/alias/searchItem" }  # .response is raw JSON
 ```
 
 ## Provider configuration
@@ -68,28 +81,28 @@ data "arubaos_object" "vlans" { path = "vlans" }   # .response is raw JSON
 ```hcl
 terraform {
   required_providers {
-    arubaos = { source = "registry.terraform.io/jamesonrgrieve/aruba-aos" }
+    opnsense = { source = "registry.terraform.io/jamesonrgrieve/opnsense" }
   }
 }
 
-provider "arubaos" {
-  host     = "192.168.2.210"     # no scheme
-  username = var.switch_user
-  password = var.switch_password # sensitive
-  insecure = true                # AOS-S self-signed cert (default true)
+provider "opnsense" {
+  host     = "192.168.7.9"      # no scheme
+  key      = var.opnsense_key
+  secret   = var.opnsense_secret # sensitive
+  insecure = true                # OPNsense self-signed cert (default true)
 }
 ```
 
 ## Local build / dev install
 
 ```sh
-make build          # -> terraform-provider-aruba-aos
+make build          # -> terraform-provider-opnsense
 make install        # installs to $DEV_BIN_DIR for a dev_overrides .tfrc
 make check          # tidy + fmt + vet + test + build (pre-commit / CI gate)
 ```
 
 For runners without registry access, install into a filesystem mirror:
-`<plugins>/registry.terraform.io/JamesonRGrieve/tofu-aruba-aos/<ver>/<os>_<arch>/terraform-provider-aruba-aos`
+`<plugins>/registry.terraform.io/JamesonRGrieve/tofu-opnsense/<ver>/<os>_<arch>/terraform-provider-opnsense`
 and point a `.terraformrc` `provider_installation { filesystem_mirror {...} }` at it.
 
 ## License

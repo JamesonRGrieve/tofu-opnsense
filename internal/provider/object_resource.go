@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -24,21 +25,22 @@ var (
 	_ resource.ResourceWithImportState = (*objectResource)(nil)
 )
 
-// NewObjectResource constructs the generic aruba_aos_object resource.
+// NewObjectResource constructs the generic opnsense_object resource.
 func NewObjectResource() resource.Resource { return &objectResource{} }
 
 type objectResource struct {
 	client *opnsense.Client
 }
 
-// objectModel is the state/plan shape for aruba_aos_object.
+// objectModel is the state/plan shape for opnsense_object.
 type objectModel struct {
-	ID           types.String `tfsdk:"id"`
-	Path         types.String `tfsdk:"path"`
-	CreatePath   types.String `tfsdk:"create_path"`
-	DeleteMethod types.String `tfsdk:"delete_method"`
-	DeleteBody   types.String `tfsdk:"delete_body"`
-	Body         types.String `tfsdk:"body"`
+	ID          types.String `tfsdk:"id"`
+	Module      types.String `tfsdk:"module"`
+	Controller  types.String `tfsdk:"controller"`
+	UUID        types.String `tfsdk:"uuid"`
+	Singleton   types.Bool   `tfsdk:"singleton"`
+	Reconfigure types.String `tfsdk:"reconfigure"`
+	Body        types.String `tfsdk:"body"`
 }
 
 func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -47,43 +49,54 @@ func (r *objectResource) Metadata(_ context.Context, req resource.MetadataReques
 
 func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A generic ArubaOS-Switch REST resource addressed by its `/rest/v8` path. " +
-			"Covers 100% of the AOS-S API: any singleton (`system`, `stp`, `dns`, `lldp`) or " +
-			"collection item (`vlans/40`, `vlans-ports/40-3`, `ports/5`, `snmp-server/communities/public`). " +
-			"`body` declares only the keys this resource manages; device-returned keys outside `body` are " +
-			"ignored for drift, so a subset declaration imports to 0-diff and never clobbers unmanaged fields.",
+		MarkdownDescription: "A generic OPNsense API resource addressed by `module`/`controller`. " +
+			"Covers the standard model CRUD pattern (`addItem`/`getItem`/`setItem`/`delItem` plus a " +
+			"`reconfigure`/apply call) for collection items such as `firewall`/`alias`, `firewall`/`filter` (rule), " +
+			"`unbound`/`host_override`; and the settings-singleton `get`/`set` pattern (`singleton = true`) for " +
+			"controllers like `unbound`/`general` or `firewall`/`settings`. " +
+			"`body` declares only the keys this resource manages; device-returned keys outside `body` are ignored " +
+			"for drift, so a subset declaration imports to 0-diff and never clobbers unmanaged fields.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
-				MarkdownDescription: "Resource id — equal to `path`.",
+				MarkdownDescription: "Resource id — `<module>/<controller>` for a singleton, `<module>/<controller>/<uuid>` for a collection item.",
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"path": schema.StringAttribute{
+			"module": schema.StringAttribute{
+				Required:            true,
+				MarkdownDescription: "API module, e.g. `firewall`, `unbound`, `interfaces`. First path segment under `/api`.",
+				PlanModifiers:       []planmodifier.String{stringplanmodifier.RequiresReplace()},
+			},
+			"controller": schema.StringAttribute{
 				Required: true,
-				MarkdownDescription: "Addressed resource path under `/rest/v8` (leading slash optional), " +
-					"used for GET/PUT/DELETE. E.g. `vlans/40`, `system`, `vlans-ports/40-3`.",
+				MarkdownDescription: "API controller, e.g. `alias`, `filter`, `host_override`, `general`. " +
+					"Also the JSON envelope key used to wrap `body` on write and to unwrap the device object on read.",
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
-			"create_path": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "Collection path to POST to on create (e.g. `vlans` while `path` is `vlans/40`). " +
-					"When unset, create is an idempotent PUT to `path`. Carry it in the import id " +
-					"(`<path>|<create_path>`) so an imported resource matches config and lands at 0-diff.",
+			"uuid": schema.StringAttribute{
+				Computed: true,
+				MarkdownDescription: "Server-assigned UUID of a collection item (empty for a `singleton`). " +
+					"Captured from the `addItem` response on create.",
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
-			"delete_method": schema.StringAttribute{
+			"singleton": schema.BoolAttribute{
 				Optional: true,
-				MarkdownDescription: "How to destroy: `DELETE` (default), `PUT` (send `delete_body` to `path` — " +
-					"reset a singleton to default), or `NONE` (no-op for un-deletable singletons). Carry it in the " +
-					"import id (`<path>|<create_path>|<delete_method>`) to match config.",
+				Computed: true,
+				Default:  booldefault.StaticBool(false),
+				MarkdownDescription: "When true this is a settings singleton: create/update via `<module>/<controller>/set` and " +
+					"read via `<module>/<controller>/get` (no UUID); destroy is a no-op. When false (default) it is a collection " +
+					"item driven by `addItem`/`getItem/<uuid>`/`setItem/<uuid>`/`delItem/<uuid>`.",
+				PlanModifiers: []planmodifier.Bool{requiresReplaceBool{}},
 			},
-			"delete_body": schema.StringAttribute{
-				Optional:            true,
-				MarkdownDescription: "JSON body PUT to `path` on destroy when `delete_method = \"PUT\"`. Import id field 4.",
+			"reconfigure": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Command path (relative to `/api`) to POST after every write to apply the change, " +
+					"e.g. `firewall/alias/reconfigure` or `unbound/service/reconfigure`. Omit to skip the apply step.",
 			},
 			"body": schema.StringAttribute{
 				Required: true,
-				MarkdownDescription: "JSON object of the declared (managed) attributes. State holds the full " +
-					"device object; drift is detected only on these keys.",
+				MarkdownDescription: "JSON object of the declared (managed) fields. Sent (wrapped in the `controller` envelope) " +
+					"on create/update; state holds the full device object and drift is detected only on these keys.",
 				PlanModifiers: []planmodifier.String{subsetSuppress{}},
 			},
 		},
@@ -103,24 +116,87 @@ func (r *objectResource) Configure(_ context.Context, req resource.ConfigureRequ
 	r.client = client
 }
 
-// normPath ensures a leading slash.
-func normPath(p string) string {
-	p = strings.TrimSpace(p)
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
+// cmdPath builds an /api command path: /<module>/<controller>/<command>[/<uuid>].
+func cmdPath(module, controller, command, uuid string) string {
+	p := "/" + strings.Trim(module, "/") + "/" + strings.Trim(controller, "/") + "/" + command
+	if uuid != "" {
+		p += "/" + uuid
 	}
 	return p
 }
 
-// parentCollection returns the collection path for an item path by dropping the
-// last segment: "/vlans-ports/58-41" -> "/vlans-ports", "/vlans/58" -> "/vlans".
-// Returns "" for a top-level singleton (no parent).
-func parentCollection(p string) string {
-	i := strings.LastIndex(p, "/")
-	if i <= 0 {
-		return ""
+// wrap envelopes the declared body under the controller key, as OPNsense
+// addItem/setItem/set expect: {"<controller>": {...body}}.
+func wrap(controller string, body []byte) ([]byte, error) {
+	var inner json.RawMessage = body
+	return json.Marshal(map[string]json.RawMessage{controller: inner})
+}
+
+// unwrap extracts the {"<controller>": {...}} envelope returned by
+// getItem/get. Returns (object, true) on success, ("", false) when the
+// envelope is absent or the node is empty/missing (item gone).
+func unwrap(controller string, raw []byte) (string, bool) {
+	var env map[string]json.RawMessage
+	if json.Unmarshal(raw, &env) != nil {
+		return "", false
 	}
-	return p[:i]
+	node, ok := env[controller]
+	if !ok {
+		return "", false
+	}
+	// getBase returns [] (empty object) for a missing UUID; treat an empty
+	// object as "not found" so a deleted item is removed from state.
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(node, &obj) != nil || len(obj) == 0 {
+		return "", false
+	}
+	compact, err := compactJSON(node)
+	if err != nil {
+		return "", false
+	}
+	return compact, true
+}
+
+// apiResult is the common OPNsense write-command response envelope.
+type apiResult struct {
+	Result      string                     `json:"result"`
+	UUID        string                     `json:"uuid"`
+	Validations map[string]json.RawMessage `json:"validations"`
+}
+
+// checkResult parses a write-command response and returns an error when the
+// API reports a failure or validation errors. uuid is the captured item id.
+func checkResult(op string, raw []byte) (string, error) {
+	var res apiResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return "", fmt.Errorf("opnsense %s: invalid JSON response: %s", op, string(raw))
+	}
+	switch res.Result {
+	case "saved", "deleted", "ok":
+		return res.UUID, nil
+	case "":
+		// Some action commands (reconfigure) return {"status":"ok"} with no
+		// "result" key — accept an absent result as success.
+		return res.UUID, nil
+	default:
+		if len(res.Validations) > 0 {
+			vs, _ := json.Marshal(res.Validations)
+			return "", fmt.Errorf("opnsense %s failed: %s (validations: %s)", op, res.Result, string(vs))
+		}
+		return "", fmt.Errorf("opnsense %s failed: result=%q (%s)", op, res.Result, string(raw))
+	}
+}
+
+// reconfigure POSTs the configured apply command, if any.
+func (r *objectResource) reconfigure(m objectModel) error {
+	if m.Reconfigure.IsNull() || m.Reconfigure.ValueString() == "" {
+		return nil
+	}
+	p := "/" + strings.Trim(m.Reconfigure.ValueString(), "/")
+	if _, err := r.client.Post(p, nil); err != nil {
+		return fmt.Errorf("reconfigure %s: %w", p, err)
+	}
+	return nil
 }
 
 func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -134,30 +210,49 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
 		return
 	}
-	var err error
-	if !m.CreatePath.IsNull() && m.CreatePath.ValueString() != "" {
-		// Explicit collection POST (e.g. /vlans).
-		_, err = r.client.Post(normPath(m.CreatePath.ValueString()), body)
-	} else {
-		// Idempotent PUT to the item path; if the item doesn't exist yet
-		// (AOS-S replies 404 to PUT on a not-yet-present collection item, e.g.
-		// a new vlans-ports membership), fall back to POSTing the parent
-		// collection. This makes the generic resource handle both upsert-PUT
-		// singletons and POST-create collections without an explicit create_path.
-		p := normPath(m.Path.ValueString())
-		_, err = r.client.Put(p, body)
-		if err != nil && opnsense.NotFound(err) {
-			if parent := parentCollection(p); parent != "" {
-				_, err = r.client.Post(parent, body)
-			}
-		}
-	}
+	module, controller := m.Module.ValueString(), m.Controller.ValueString()
+	payload, err := wrap(controller, body)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S create failed", err.Error())
+		resp.Diagnostics.AddError("OPNsense create: failed to build payload", err.Error())
 		return
 	}
-	m.ID = m.Path
-	// Store the declared body verbatim so the create plan/state are consistent;
+
+	if m.Singleton.ValueBool() {
+		raw, err := r.client.Post(cmdPath(module, controller, "set", ""), payload)
+		if err != nil {
+			resp.Diagnostics.AddError("OPNsense create failed", err.Error())
+			return
+		}
+		if _, err := checkResult("set", raw); err != nil {
+			resp.Diagnostics.AddError("OPNsense create failed", err.Error())
+			return
+		}
+		m.UUID = types.StringValue("")
+		m.ID = types.StringValue(module + "/" + controller)
+	} else {
+		raw, err := r.client.Post(cmdPath(module, controller, "addItem", ""), payload)
+		if err != nil {
+			resp.Diagnostics.AddError("OPNsense create failed", err.Error())
+			return
+		}
+		uuid, err := checkResult("addItem", raw)
+		if err != nil {
+			resp.Diagnostics.AddError("OPNsense create failed", err.Error())
+			return
+		}
+		if uuid == "" {
+			resp.Diagnostics.AddError("OPNsense create failed", "addItem returned no uuid: "+string(raw))
+			return
+		}
+		m.UUID = types.StringValue(uuid)
+		m.ID = types.StringValue(module + "/" + controller + "/" + uuid)
+	}
+
+	if err := r.reconfigure(m); err != nil {
+		resp.Diagnostics.AddError("OPNsense reconfigure failed", err.Error())
+		return
+	}
+	// Store the declared body verbatim so create plan/state are consistent;
 	// the next refresh (Read) replaces it with the full device object.
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
@@ -168,24 +263,29 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	raw, err := r.client.Get(normPath(m.Path.ValueString()))
+	module, controller := m.Module.ValueString(), m.Controller.ValueString()
+	var p string
+	if m.Singleton.ValueBool() {
+		p = cmdPath(module, controller, "get", "")
+	} else {
+		p = cmdPath(module, controller, "getItem", m.UUID.ValueString())
+	}
+	raw, err := r.client.Get(p)
 	if err != nil {
 		if opnsense.NotFound(err) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
-		resp.Diagnostics.AddError("AOS-S read failed", err.Error())
+		resp.Diagnostics.AddError("OPNsense read failed", err.Error())
 		return
 	}
-	// Store the full device object (compacted). The subset plan modifier
-	// reconciles it against the declared config body at plan time.
-	compact, err := compactJSON(raw)
-	if err != nil {
-		resp.Diagnostics.AddError("AOS-S read: invalid JSON from device", err.Error())
+	obj, ok := unwrap(controller, raw)
+	if !ok {
+		// Empty/absent envelope — the item no longer exists.
+		resp.State.RemoveResource(ctx)
 		return
 	}
-	m.Body = types.StringValue(compact)
-	m.ID = m.Path
+	m.Body = types.StringValue(obj)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -200,11 +300,31 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		resp.Diagnostics.AddError("Invalid body", "`body` must be valid JSON")
 		return
 	}
-	if _, err := r.client.Put(normPath(m.Path.ValueString()), body); err != nil {
-		resp.Diagnostics.AddError("AOS-S update failed", err.Error())
+	module, controller := m.Module.ValueString(), m.Controller.ValueString()
+	payload, err := wrap(controller, body)
+	if err != nil {
+		resp.Diagnostics.AddError("OPNsense update: failed to build payload", err.Error())
 		return
 	}
-	m.ID = m.Path
+	var p string
+	if m.Singleton.ValueBool() {
+		p = cmdPath(module, controller, "set", "")
+	} else {
+		p = cmdPath(module, controller, "setItem", m.UUID.ValueString())
+	}
+	raw, err := r.client.Post(p, payload)
+	if err != nil {
+		resp.Diagnostics.AddError("OPNsense update failed", err.Error())
+		return
+	}
+	if _, err := checkResult("setItem", raw); err != nil {
+		resp.Diagnostics.AddError("OPNsense update failed", err.Error())
+		return
+	}
+	if err := r.reconfigure(m); err != nil {
+		resp.Diagnostics.AddError("OPNsense reconfigure failed", err.Error())
+		return
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -214,50 +334,83 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	method := "DELETE"
-	if !m.DeleteMethod.IsNull() && m.DeleteMethod.ValueString() != "" {
-		method = strings.ToUpper(m.DeleteMethod.ValueString())
+	module, controller := m.Module.ValueString(), m.Controller.ValueString()
+	if m.Singleton.ValueBool() {
+		// Settings singletons cannot be deleted; just drop from state.
+		return
 	}
-	var err error
-	switch method {
-	case "NONE":
-		// Singleton that cannot be deleted (e.g. /system); just drop from state.
-	case "PUT":
-		if m.DeleteBody.IsNull() {
-			resp.Diagnostics.AddError("delete_method=PUT requires delete_body", "no reset body provided")
-			return
-		}
-		_, err = r.client.Put(normPath(m.Path.ValueString()), []byte(m.DeleteBody.ValueString()))
-	default: // DELETE
-		_, err = r.client.Delete(normPath(m.Path.ValueString()))
-		if err != nil && opnsense.NotFound(err) {
-			err = nil // already gone
-		}
-	}
+	raw, err := r.client.Post(cmdPath(module, controller, "delItem", m.UUID.ValueString()), nil)
 	if err != nil {
-		resp.Diagnostics.AddError("AOS-S delete failed", err.Error())
+		if opnsense.NotFound(err) {
+			return // already gone
+		}
+		resp.Diagnostics.AddError("OPNsense delete failed", err.Error())
+		return
+	}
+	if _, err := checkResult("delItem", raw); err != nil {
+		resp.Diagnostics.AddError("OPNsense delete failed", err.Error())
+		return
+	}
+	if err := r.reconfigure(m); err != nil {
+		resp.Diagnostics.AddError("OPNsense reconfigure failed", err.Error())
 	}
 }
 
 func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import id is a pipe-delimited tuple so the imported state matches the
-	// config's operational hints exactly (→ 0-diff, no spurious update/replace):
-	//   <path>[|<create_path>[|<delete_method>[|<delete_body>]]]
-	// Empty fields are treated as null. Body is populated on the following Read.
-	parts := strings.Split(req.ID, "|")
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("path"), parts[0])...)
-	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), parts[0])...)
-	setOpt := func(p string, i int) {
-		if i < len(parts) && parts[i] != "" {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), parts[i])...)
-		} else {
-			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(p), types.StringNull())...)
-		}
+	// Import id is a slash-delimited address; trailing `|`-fields carry the
+	// operational hints so imported state matches config (→ 0-diff):
+	//   <module>/<controller>[/<uuid>][|<reconfigure>]
+	// A two-segment address (no uuid) is a singleton; three segments is a
+	// collection item. Body is populated on the following Read.
+	idPart, reconf, _ := strings.Cut(req.ID, "|")
+	segs := strings.Split(strings.Trim(idPart, "/"), "/")
+	if len(segs) < 2 || len(segs) > 3 {
+		resp.Diagnostics.AddError("Invalid import id",
+			"expected `<module>/<controller>` (singleton) or `<module>/<controller>/<uuid>` (item), "+
+				"optionally `|<reconfigure>`; got: "+req.ID)
+		return
 	}
-	setOpt("create_path", 1)
-	setOpt("delete_method", 2)
-	setOpt("delete_body", 3)
+	module, controller := segs[0], segs[1]
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("module"), module)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("controller"), controller)...)
+	if len(segs) == 3 {
+		uuid := segs[2]
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("uuid"), uuid)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("singleton"), false)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), module+"/"+controller+"/"+uuid)...)
+	} else {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("uuid"), "")...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("singleton"), true)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), module+"/"+controller)...)
+	}
+	if reconf != "" {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("reconfigure"), reconf)...)
+	} else {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("reconfigure"), types.StringNull())...)
+	}
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
+}
+
+// ---------------------------------------------------------------------------
+// requiresReplaceBool — RequiresReplace for the singleton flag (it selects the
+// command family; flipping it changes the resource identity).
+// ---------------------------------------------------------------------------
+
+type requiresReplaceBool struct{}
+
+func (requiresReplaceBool) Description(context.Context) string {
+	return "Changing `singleton` forces resource replacement."
+}
+func (requiresReplaceBool) MarkdownDescription(context.Context) string {
+	return (requiresReplaceBool{}).Description(nil)
+}
+func (requiresReplaceBool) PlanModifyBool(_ context.Context, req planmodifier.BoolRequest, resp *planmodifier.BoolResponse) {
+	if req.StateValue.IsNull() || req.PlanValue.IsNull() || req.PlanValue.IsUnknown() {
+		return
+	}
+	if req.StateValue.ValueBool() != req.PlanValue.ValueBool() {
+		resp.RequiresReplace = true
+	}
 }
 
 // ---------------------------------------------------------------------------

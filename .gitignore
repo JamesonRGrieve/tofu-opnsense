@@ -1,5 +1,5 @@
 # Build artifacts
-/terraform-provider-aruba-aos
+/terraform-provider-opnsense
 /dist/
 *.exe
 
