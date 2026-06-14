@@ -40,7 +40,31 @@ type objectModel struct {
 	UUID        types.String `tfsdk:"uuid"`
 	Singleton   types.Bool   `tfsdk:"singleton"`
 	Reconfigure types.String `tfsdk:"reconfigure"`
+	ItemSuffix  types.String `tfsdk:"item_suffix"`
+	Envelope    types.String `tfsdk:"envelope"`
 	Body        types.String `tfsdk:"body"`
+}
+
+// itemSuffix is the collection-item command noun (default "Item"), so the verbs
+// become add<Suffix>/get<Suffix>/set<Suffix>/del<Suffix>. The base model uses
+// "Item"; OPNsense plugins like os-haproxy (addServer/getServer/…) and
+// os-acme-client (addCertificate/…) use a bespoke noun instead.
+func itemSuffix(m objectModel) string {
+	if s := m.ItemSuffix.ValueString(); s != "" {
+		return s
+	}
+	return "Item"
+}
+
+// envelopeKey is the JSON wrap/unwrap key. For the base model it equals the
+// controller (`{"alias":{…}}`); plugin items envelope under the item noun, not
+// the controller (os-haproxy `addServer` under `haproxy/settings` expects
+// `{"server":{…}}`), so `envelope` overrides it when set.
+func envelopeKey(m objectModel) string {
+	if e := m.Envelope.ValueString(); e != "" {
+		return e
+	}
+	return m.Controller.ValueString()
 }
 
 func (r *objectResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -92,6 +116,20 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Optional: true,
 				MarkdownDescription: "Command path (relative to `/api`) to POST after every write to apply the change, " +
 					"e.g. `firewall/alias/reconfigure` or `unbound/service/reconfigure`. Omit to skip the apply step.",
+			},
+			"item_suffix": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Collection-item command noun (default `Item`). The CRUD verbs become " +
+					"`add<suffix>`/`get<suffix>`/`set<suffix>`/`del<suffix>`. OPNsense plugins use bespoke nouns " +
+					"instead of the base-model `Item`: os-haproxy → `Server`/`Backend`/`Frontend`/`Acl`/`Action`, " +
+					"os-acme-client → `Account`/`Validation`/`Certificate`. Ignored for `singleton`.",
+			},
+			"envelope": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "JSON wrap/unwrap key for `body` (default: `controller`). The base model envelopes " +
+					"under the controller (`{\"alias\":{…}}`); plugin items envelope under the item noun, not the " +
+					"controller — os-haproxy `addServer` (controller `settings`) expects `{\"server\":{…}}`, so set " +
+					"`envelope = \"server\"`.",
 			},
 			"body": schema.StringAttribute{
 				Required: true,
@@ -211,7 +249,7 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 	module, controller := m.Module.ValueString(), m.Controller.ValueString()
-	payload, err := wrap(controller, body)
+	payload, err := wrap(envelopeKey(m), body)
 	if err != nil {
 		resp.Diagnostics.AddError("OPNsense create: failed to build payload", err.Error())
 		return
@@ -230,18 +268,19 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 		m.UUID = types.StringValue("")
 		m.ID = types.StringValue(module + "/" + controller)
 	} else {
-		raw, err := r.client.Post(cmdPath(module, controller, "addItem", ""), payload)
+		addCmd := "add" + itemSuffix(m)
+		raw, err := r.client.Post(cmdPath(module, controller, addCmd, ""), payload)
 		if err != nil {
 			resp.Diagnostics.AddError("OPNsense create failed", err.Error())
 			return
 		}
-		uuid, err := checkResult("addItem", raw)
+		uuid, err := checkResult(addCmd, raw)
 		if err != nil {
 			resp.Diagnostics.AddError("OPNsense create failed", err.Error())
 			return
 		}
 		if uuid == "" {
-			resp.Diagnostics.AddError("OPNsense create failed", "addItem returned no uuid: "+string(raw))
+			resp.Diagnostics.AddError("OPNsense create failed", addCmd+" returned no uuid: "+string(raw))
 			return
 		}
 		m.UUID = types.StringValue(uuid)
@@ -268,7 +307,7 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if m.Singleton.ValueBool() {
 		p = cmdPath(module, controller, "get", "")
 	} else {
-		p = cmdPath(module, controller, "getItem", m.UUID.ValueString())
+		p = cmdPath(module, controller, "get"+itemSuffix(m), m.UUID.ValueString())
 	}
 	raw, err := r.client.Get(p)
 	if err != nil {
@@ -279,7 +318,7 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 		resp.Diagnostics.AddError("OPNsense read failed", err.Error())
 		return
 	}
-	obj, ok := unwrap(controller, raw)
+	obj, ok := unwrap(envelopeKey(m), raw)
 	if !ok {
 		// Empty/absent envelope — the item no longer exists.
 		resp.State.RemoveResource(ctx)
@@ -301,23 +340,25 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 	module, controller := m.Module.ValueString(), m.Controller.ValueString()
-	payload, err := wrap(controller, body)
+	payload, err := wrap(envelopeKey(m), body)
 	if err != nil {
 		resp.Diagnostics.AddError("OPNsense update: failed to build payload", err.Error())
 		return
 	}
-	var p string
+	var p, setCmd string
 	if m.Singleton.ValueBool() {
+		setCmd = "set"
 		p = cmdPath(module, controller, "set", "")
 	} else {
-		p = cmdPath(module, controller, "setItem", m.UUID.ValueString())
+		setCmd = "set" + itemSuffix(m)
+		p = cmdPath(module, controller, setCmd, m.UUID.ValueString())
 	}
 	raw, err := r.client.Post(p, payload)
 	if err != nil {
 		resp.Diagnostics.AddError("OPNsense update failed", err.Error())
 		return
 	}
-	if _, err := checkResult("setItem", raw); err != nil {
+	if _, err := checkResult(setCmd, raw); err != nil {
 		resp.Diagnostics.AddError("OPNsense update failed", err.Error())
 		return
 	}
@@ -339,7 +380,8 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		// Settings singletons cannot be deleted; just drop from state.
 		return
 	}
-	raw, err := r.client.Post(cmdPath(module, controller, "delItem", m.UUID.ValueString()), nil)
+	delCmd := "del" + itemSuffix(m)
+	raw, err := r.client.Post(cmdPath(module, controller, delCmd, m.UUID.ValueString()), nil)
 	if err != nil {
 		if opnsense.NotFound(err) {
 			return // already gone
@@ -347,7 +389,7 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		resp.Diagnostics.AddError("OPNsense delete failed", err.Error())
 		return
 	}
-	if _, err := checkResult("delItem", raw); err != nil {
+	if _, err := checkResult(delCmd, raw); err != nil {
 		resp.Diagnostics.AddError("OPNsense delete failed", err.Error())
 		return
 	}
@@ -358,11 +400,21 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 
 func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	// Import id is a slash-delimited address; trailing `|`-fields carry the
-	// operational hints so imported state matches config (→ 0-diff):
-	//   <module>/<controller>[/<uuid>][|<reconfigure>]
+	// operational hints (positional) so imported state matches config (→ 0-diff):
+	//   <module>/<controller>[/<uuid>][|<reconfigure>[|<item_suffix>[|<envelope>]]]
 	// A two-segment address (no uuid) is a singleton; three segments is a
-	// collection item. Body is populated on the following Read.
-	idPart, reconf, _ := strings.Cut(req.ID, "|")
+	// collection item. Plugin items (os-haproxy/os-acme) pass item_suffix +
+	// envelope, e.g. `haproxy/settings/<uuid>|haproxy/service/reconfigure|Server|server`.
+	// Body is populated on the following Read.
+	pipeParts := strings.Split(req.ID, "|")
+	idPart := pipeParts[0]
+	pipeField := func(i int) string {
+		if i < len(pipeParts) {
+			return strings.TrimSpace(pipeParts[i])
+		}
+		return ""
+	}
+	reconf, itemSfx, envel := pipeField(1), pipeField(2), pipeField(3)
 	segs := strings.Split(strings.Trim(idPart, "/"), "/")
 	if len(segs) < 2 || len(segs) > 3 {
 		resp.Diagnostics.AddError("Invalid import id",
@@ -383,11 +435,16 @@ func (r *objectResource) ImportState(ctx context.Context, req resource.ImportSta
 		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("singleton"), true)...)
 		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), module+"/"+controller)...)
 	}
-	if reconf != "" {
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("reconfigure"), reconf)...)
-	} else {
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("reconfigure"), types.StringNull())...)
+	setStrOrNull := func(attr, val string) {
+		if val != "" {
+			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(attr), val)...)
+		} else {
+			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root(attr), types.StringNull())...)
+		}
 	}
+	setStrOrNull("reconfigure", reconf)
+	setStrOrNull("item_suffix", itemSfx)
+	setStrOrNull("envelope", envel)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
 }
 

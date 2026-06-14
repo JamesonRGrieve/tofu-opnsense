@@ -2,7 +2,11 @@
 
 package provider
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/hashicorp/terraform-plugin-framework/types"
+)
 
 func TestSubsetMatches(t *testing.T) {
 	cases := []struct {
@@ -182,6 +186,81 @@ func TestCheckResult(t *testing.T) {
 				t.Fatalf("checkResult uuid = %q, want %q", uuid, tc.wantUUID)
 			}
 		})
+	}
+}
+
+func TestItemSuffix(t *testing.T) {
+	cases := []struct {
+		name string
+		m    objectModel
+		want string
+	}{
+		{"unset → base model Item", objectModel{ItemSuffix: types.StringNull()}, "Item"},
+		{"empty string → Item", objectModel{ItemSuffix: types.StringValue("")}, "Item"},
+		{"os-haproxy server", objectModel{ItemSuffix: types.StringValue("Server")}, "Server"},
+		{"os-acme certificate", objectModel{ItemSuffix: types.StringValue("Certificate")}, "Certificate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := itemSuffix(tc.m); got != tc.want {
+				t.Fatalf("itemSuffix() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnvelopeKey(t *testing.T) {
+	cases := []struct {
+		name string
+		m    objectModel
+		want string
+	}{
+		{"unset → controller (base model)", objectModel{Controller: types.StringValue("alias"), Envelope: types.StringNull()}, "alias"},
+		{"empty → controller", objectModel{Controller: types.StringValue("settings"), Envelope: types.StringValue("")}, "settings"},
+		{"override → item noun (haproxy server)", objectModel{Controller: types.StringValue("settings"), Envelope: types.StringValue("server")}, "server"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := envelopeKey(tc.m); got != tc.want {
+				t.Fatalf("envelopeKey() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPluginVerbPaths exercises the full os-haproxy contract: the computed
+// add/get/set/del<Suffix> verbs and the item-noun envelope (NOT the controller).
+func TestPluginVerbPaths(t *testing.T) {
+	m := objectModel{
+		Module:     types.StringValue("haproxy"),
+		Controller: types.StringValue("settings"),
+		ItemSuffix: types.StringValue("Server"),
+		Envelope:   types.StringValue("server"),
+	}
+	module, controller := m.Module.ValueString(), m.Controller.ValueString()
+
+	if got := cmdPath(module, controller, "add"+itemSuffix(m), ""); got != "/haproxy/settings/addServer" {
+		t.Errorf("addServer path = %q", got)
+	}
+	if got := cmdPath(module, controller, "get"+itemSuffix(m), "u1"); got != "/haproxy/settings/getServer/u1" {
+		t.Errorf("getServer path = %q", got)
+	}
+	if got := cmdPath(module, controller, "set"+itemSuffix(m), "u1"); got != "/haproxy/settings/setServer/u1" {
+		t.Errorf("setServer path = %q", got)
+	}
+	if got := cmdPath(module, controller, "del"+itemSuffix(m), "u1"); got != "/haproxy/settings/delServer/u1" {
+		t.Errorf("delServer path = %q", got)
+	}
+	// Envelope wraps under the item noun, not the controller.
+	wrapped, err := wrap(envelopeKey(m), []byte(`{"name":"web1","address":"10.0.0.1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(wrapped) != `{"server":{"name":"web1","address":"10.0.0.1"}}` {
+		t.Errorf("wrap envelope = %q", string(wrapped))
+	}
+	if obj, ok := unwrap(envelopeKey(m), []byte(`{"server":{"name":"web1","enabled":"1"}}`)); !ok || obj != `{"enabled":"1","name":"web1"}` {
+		t.Errorf("unwrap envelope = %q ok=%v", obj, ok)
 	}
 }
 
