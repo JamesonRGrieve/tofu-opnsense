@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/JamesonRGrieve/tofu-opnsense/internal/opnsense"
@@ -41,19 +42,42 @@ type objectModel struct {
 	Singleton   types.Bool   `tfsdk:"singleton"`
 	Reconfigure types.String `tfsdk:"reconfigure"`
 	ItemSuffix  types.String `tfsdk:"item_suffix"`
+	SetCommand  types.String `tfsdk:"set_command"`
 	Envelope    types.String `tfsdk:"envelope"`
 	Body        types.String `tfsdk:"body"`
 }
 
+// bareSuffix is the sentinel item_suffix value selecting the empty/bare verb
+// family (add/get/set/del with no noun). A handful of controllers — os-acme
+// (add/get/update/del) and core IPsec VTI (add/get/set/del) — name their verbs
+// with no noun at all, which the default-to-"Item" rule cannot express.
+const bareSuffix = "none"
+
 // itemSuffix is the collection-item command noun (default "Item"), so the verbs
 // become add<Suffix>/get<Suffix>/set<Suffix>/del<Suffix>. The base model uses
 // "Item"; OPNsense plugins like os-haproxy (addServer/getServer/…) and
-// os-acme-client (addCertificate/…) use a bespoke noun instead.
+// os-acme-client (addCertificate/…) use a bespoke noun instead. The sentinel
+// "none" selects bare verbs (add/get/set/del).
 func itemSuffix(m objectModel) string {
-	if s := m.ItemSuffix.ValueString(); s != "" {
+	s := m.ItemSuffix.ValueString()
+	switch s {
+	case "":
+		return "Item"
+	case bareSuffix:
+		return ""
+	default:
 		return s
 	}
-	return "Item"
+}
+
+// setVerb is the update command. It is `set<suffix>` by default, but a few
+// controllers diverge — os-acme uses `update` (no suffix) where the rest use
+// `set`. `set_command`, when set, overrides the whole verb verbatim.
+func setVerb(m objectModel) string {
+	if v := m.SetCommand.ValueString(); v != "" {
+		return v
+	}
+	return "set" + itemSuffix(m)
 }
 
 // envelopeKey is the JSON wrap/unwrap key. For the base model it equals the
@@ -121,8 +145,14 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Optional: true,
 				MarkdownDescription: "Collection-item command noun (default `Item`). The CRUD verbs become " +
 					"`add<suffix>`/`get<suffix>`/`set<suffix>`/`del<suffix>`. OPNsense plugins use bespoke nouns " +
-					"instead of the base-model `Item`: os-haproxy → `Server`/`Backend`/`Frontend`/`Acl`/`Action`, " +
-					"os-acme-client → `Account`/`Validation`/`Certificate`. Ignored for `singleton`.",
+					"instead of the base-model `Item`: os-haproxy → `Server`/`Backend`/`Frontend`/`Acl`/`Action`. " +
+					"The sentinel `none` selects bare verbs (`add`/`get`/`set`/`del`, no noun) for controllers like " +
+					"os-acme and core IPsec VTI. Ignored for `singleton`.",
+			},
+			"set_command": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Override for the update verb (default `set<suffix>`). os-acme uses `update` " +
+					"where the rest of OPNsense uses `set`; set `set_command = \"update\"` for those controllers.",
 			},
 			"envelope": schema.StringAttribute{
 				Optional: true,
@@ -296,6 +326,94 @@ func (r *objectResource) Create(ctx context.Context, req resource.CreateRequest,
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
+// collapseOptionFields rewrites OPNsense OptionField objects in a read-back body
+// down to the plain value a config body declares. OPNsense returns a select field
+// as a map of every option to {value,selected}, e.g.
+//
+//	{"inet":{"value":"IPv4","selected":1},"inet6":{"value":"IPv6","selected":0}}
+//
+// while the declared body sends just "inet". Without collapsing, the stored state
+// never structurally matches the declared subset, so subsetMatches fails and the
+// item is re-written on every apply (harmless for most, fatal where the field is
+// required on write). This normalizes the read object so a subset declaration
+// reaches a true 0-diff. Non-OptionField objects/arrays are recursed into.
+func collapseOptionFields(jsonStr string) string {
+	var v any
+	if json.Unmarshal([]byte(jsonStr), &v) != nil {
+		return jsonStr
+	}
+	out, err := json.Marshal(collapseValue(v))
+	if err != nil {
+		return jsonStr
+	}
+	return string(out)
+}
+
+func collapseValue(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		if sel, ok := optionFieldSelection(x); ok {
+			return sel
+		}
+		for k, val := range x {
+			x[k] = collapseValue(val)
+		}
+		return x
+	case []any:
+		for i, val := range x {
+			x[i] = collapseValue(val)
+		}
+		return x
+	default:
+		return v
+	}
+}
+
+// optionFieldSelection reports whether m is an OptionField (non-empty, every
+// value an object carrying a "selected" flag) and, if so, returns the comma-
+// joined selected option keys (sorted for determinism; single-select — the
+// dominant case — yields exactly the one key).
+func optionFieldSelection(m map[string]any) (string, bool) {
+	if len(m) == 0 {
+		return "", false
+	}
+	for _, val := range m {
+		obj, ok := val.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		if _, has := obj["selected"]; !has {
+			return "", false
+		}
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	selected := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if isSelected(m[k].(map[string]any)["selected"]) {
+			selected = append(selected, k)
+		}
+	}
+	return strings.Join(selected, ","), true
+}
+
+func isSelected(v any) bool {
+	switch s := v.(type) {
+	case float64:
+		return s != 0
+	case json.Number:
+		return s.String() != "0" && s.String() != ""
+	case string:
+		return s == "1" || s == "true"
+	case bool:
+		return s
+	}
+	return false
+}
+
 func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var m objectModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &m)...)
@@ -324,7 +442,7 @@ func (r *objectResource) Read(ctx context.Context, req resource.ReadRequest, res
 		resp.State.RemoveResource(ctx)
 		return
 	}
-	m.Body = types.StringValue(obj)
+	m.Body = types.StringValue(collapseOptionFields(obj))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &m)...)
 }
 
@@ -350,7 +468,7 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		setCmd = "set"
 		p = cmdPath(module, controller, "set", "")
 	} else {
-		setCmd = "set" + itemSuffix(m)
+		setCmd = setVerb(m)
 		p = cmdPath(module, controller, setCmd, m.UUID.ValueString())
 	}
 	raw, err := r.client.Post(p, payload)
@@ -401,7 +519,7 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	// Import id is a slash-delimited address; trailing `|`-fields carry the
 	// operational hints (positional) so imported state matches config (→ 0-diff):
-	//   <module>/<controller>[/<uuid>][|<reconfigure>[|<item_suffix>[|<envelope>]]]
+	//   <module>/<controller>[/<uuid>][|<reconfigure>[|<item_suffix>[|<envelope>[|<set_command>]]]]
 	// A two-segment address (no uuid) is a singleton; three segments is a
 	// collection item. Plugin items (os-haproxy/os-acme) pass item_suffix +
 	// envelope, e.g. `haproxy/settings/<uuid>|haproxy/service/reconfigure|Server|server`.
@@ -414,7 +532,7 @@ func (r *objectResource) ImportState(ctx context.Context, req resource.ImportSta
 		}
 		return ""
 	}
-	reconf, itemSfx, envel := pipeField(1), pipeField(2), pipeField(3)
+	reconf, itemSfx, envel, setCmd := pipeField(1), pipeField(2), pipeField(3), pipeField(4)
 	segs := strings.Split(strings.Trim(idPart, "/"), "/")
 	if len(segs) < 2 || len(segs) > 3 {
 		resp.Diagnostics.AddError("Invalid import id",
@@ -444,6 +562,7 @@ func (r *objectResource) ImportState(ctx context.Context, req resource.ImportSta
 	}
 	setStrOrNull("reconfigure", reconf)
 	setStrOrNull("item_suffix", itemSfx)
+	setStrOrNull("set_command", setCmd)
 	setStrOrNull("envelope", envel)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
 }

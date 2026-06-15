@@ -3,6 +3,8 @@
 package provider
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -67,6 +69,59 @@ func TestSubsetMatches(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := subsetMatches(tc.prior, tc.cfg); got != tc.wantMatched {
 				t.Fatalf("subsetMatches() = %v, want %v", got, tc.wantMatched)
+			}
+		})
+	}
+}
+
+func TestCollapseOptionFields(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "single-select option field -> selected key (numeric selected)",
+			in:   `{"ipprotocol":{"inet":{"value":"IPv4","selected":1},"inet6":{"value":"IPv6","selected":0}},"name":"gw"}`,
+			want: `{"ipprotocol":"inet","name":"gw"}`,
+		},
+		{
+			name: "string selected flag",
+			in:   `{"type":{"network":{"value":"Network","selected":"1"},"host":{"value":"Host","selected":"0"}}}`,
+			want: `{"type":"network"}`,
+		},
+		{
+			name: "multi-select -> comma-joined sorted keys",
+			in:   `{"iface":{"opt5":{"value":"B","selected":1},"opt2":{"value":"A","selected":1},"wan":{"value":"W","selected":0}}}`,
+			want: `{"iface":"opt2,opt5"}`,
+		},
+		{
+			name: "none selected -> empty string",
+			in:   `{"iface":{"wan":{"value":"W","selected":0},"lan":{"value":"L","selected":0}}}`,
+			want: `{"iface":""}`,
+		},
+		{
+			name: "plain string fields untouched",
+			in:   `{"name":"x","content":"10.0.0.0/24"}`,
+			want: `{"content":"10.0.0.0/24","name":"x"}`,
+		},
+		{
+			name: "non-option nested object recursed, not collapsed",
+			in:   `{"opt":{"a":{"value":"A"},"b":{"value":"B"}}}`,
+			want: `{"opt":{"a":{"value":"A"},"b":{"value":"B"}}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := collapseOptionFields(tc.in)
+			// compare structurally (key order from map marshal is non-deterministic)
+			var g, w any
+			if err := json.Unmarshal([]byte(got), &g); err != nil {
+				t.Fatalf("output not JSON: %s", got)
+			}
+			_ = json.Unmarshal([]byte(tc.want), &w)
+			if !reflect.DeepEqual(g, w) {
+				t.Fatalf("collapseOptionFields() = %s, want %s", got, tc.want)
 			}
 		})
 	}
@@ -199,6 +254,7 @@ func TestItemSuffix(t *testing.T) {
 		{"empty string → Item", objectModel{ItemSuffix: types.StringValue("")}, "Item"},
 		{"os-haproxy server", objectModel{ItemSuffix: types.StringValue("Server")}, "Server"},
 		{"os-acme certificate", objectModel{ItemSuffix: types.StringValue("Certificate")}, "Certificate"},
+		{"sentinel none → bare", objectModel{ItemSuffix: types.StringValue("none")}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -206,6 +262,69 @@ func TestItemSuffix(t *testing.T) {
 				t.Fatalf("itemSuffix() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSetVerb(t *testing.T) {
+	cases := []struct {
+		name string
+		m    objectModel
+		want string
+	}{
+		{"default base model → setItem", objectModel{ItemSuffix: types.StringNull(), SetCommand: types.StringNull()}, "setItem"},
+		{"suffix → set<Suffix>", objectModel{ItemSuffix: types.StringValue("Server"), SetCommand: types.StringNull()}, "setServer"},
+		{"bare sentinel → set", objectModel{ItemSuffix: types.StringValue("none"), SetCommand: types.StringNull()}, "set"},
+		{"override → verbatim (os-acme update)", objectModel{ItemSuffix: types.StringValue("none"), SetCommand: types.StringValue("update")}, "update"},
+		{"override wins over suffix", objectModel{ItemSuffix: types.StringValue("Server"), SetCommand: types.StringValue("update")}, "update"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := setVerb(tc.m); got != tc.want {
+				t.Fatalf("setVerb() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBareVerbPaths exercises the bare-verb controllers: os-acme (add/get/del
+// bare, update for set) and core IPsec VTI (add/get/set/del bare).
+func TestBareVerbPaths(t *testing.T) {
+	acme := objectModel{
+		Module:     types.StringValue("acmeclient"),
+		Controller: types.StringValue("accounts"),
+		ItemSuffix: types.StringValue("none"),
+		Envelope:   types.StringValue("account"),
+		SetCommand: types.StringValue("update"),
+	}
+	am, ac := acme.Module.ValueString(), acme.Controller.ValueString()
+	if got := cmdPath(am, ac, "add"+itemSuffix(acme), ""); got != "/acmeclient/accounts/add" {
+		t.Errorf("acme add path = %q", got)
+	}
+	if got := cmdPath(am, ac, "get"+itemSuffix(acme), "u1"); got != "/acmeclient/accounts/get/u1" {
+		t.Errorf("acme get path = %q", got)
+	}
+	if got := cmdPath(am, ac, setVerb(acme), "u1"); got != "/acmeclient/accounts/update/u1" {
+		t.Errorf("acme set(update) path = %q", got)
+	}
+	if got := cmdPath(am, ac, "del"+itemSuffix(acme), "u1"); got != "/acmeclient/accounts/del/u1" {
+		t.Errorf("acme del path = %q", got)
+	}
+	if w, _ := wrap(envelopeKey(acme), []byte(`{"name":"le"}`)); string(w) != `{"account":{"name":"le"}}` {
+		t.Errorf("acme wrap = %q", string(w))
+	}
+
+	vti := objectModel{
+		Module:     types.StringValue("ipsec"),
+		Controller: types.StringValue("vti"),
+		ItemSuffix: types.StringValue("none"),
+		Envelope:   types.StringValue("vti"),
+	}
+	vm, vc := vti.Module.ValueString(), vti.Controller.ValueString()
+	if got := cmdPath(vm, vc, "add"+itemSuffix(vti), ""); got != "/ipsec/vti/add" {
+		t.Errorf("vti add path = %q", got)
+	}
+	if got := cmdPath(vm, vc, setVerb(vti), "u1"); got != "/ipsec/vti/set/u1" {
+		t.Errorf("vti set path = %q", got)
 	}
 }
 
