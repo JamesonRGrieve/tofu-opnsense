@@ -41,19 +41,42 @@ type objectModel struct {
 	Singleton   types.Bool   `tfsdk:"singleton"`
 	Reconfigure types.String `tfsdk:"reconfigure"`
 	ItemSuffix  types.String `tfsdk:"item_suffix"`
+	SetCommand  types.String `tfsdk:"set_command"`
 	Envelope    types.String `tfsdk:"envelope"`
 	Body        types.String `tfsdk:"body"`
 }
 
+// bareSuffix is the sentinel item_suffix value selecting the empty/bare verb
+// family (add/get/set/del with no noun). A handful of controllers — os-acme
+// (add/get/update/del) and core IPsec VTI (add/get/set/del) — name their verbs
+// with no noun at all, which the default-to-"Item" rule cannot express.
+const bareSuffix = "none"
+
 // itemSuffix is the collection-item command noun (default "Item"), so the verbs
 // become add<Suffix>/get<Suffix>/set<Suffix>/del<Suffix>. The base model uses
 // "Item"; OPNsense plugins like os-haproxy (addServer/getServer/…) and
-// os-acme-client (addCertificate/…) use a bespoke noun instead.
+// os-acme-client (addCertificate/…) use a bespoke noun instead. The sentinel
+// "none" selects bare verbs (add/get/set/del).
 func itemSuffix(m objectModel) string {
-	if s := m.ItemSuffix.ValueString(); s != "" {
+	s := m.ItemSuffix.ValueString()
+	switch s {
+	case "":
+		return "Item"
+	case bareSuffix:
+		return ""
+	default:
 		return s
 	}
-	return "Item"
+}
+
+// setVerb is the update command. It is `set<suffix>` by default, but a few
+// controllers diverge — os-acme uses `update` (no suffix) where the rest use
+// `set`. `set_command`, when set, overrides the whole verb verbatim.
+func setVerb(m objectModel) string {
+	if v := m.SetCommand.ValueString(); v != "" {
+		return v
+	}
+	return "set" + itemSuffix(m)
 }
 
 // envelopeKey is the JSON wrap/unwrap key. For the base model it equals the
@@ -121,8 +144,14 @@ func (r *objectResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Optional: true,
 				MarkdownDescription: "Collection-item command noun (default `Item`). The CRUD verbs become " +
 					"`add<suffix>`/`get<suffix>`/`set<suffix>`/`del<suffix>`. OPNsense plugins use bespoke nouns " +
-					"instead of the base-model `Item`: os-haproxy → `Server`/`Backend`/`Frontend`/`Acl`/`Action`, " +
-					"os-acme-client → `Account`/`Validation`/`Certificate`. Ignored for `singleton`.",
+					"instead of the base-model `Item`: os-haproxy → `Server`/`Backend`/`Frontend`/`Acl`/`Action`. " +
+					"The sentinel `none` selects bare verbs (`add`/`get`/`set`/`del`, no noun) for controllers like " +
+					"os-acme and core IPsec VTI. Ignored for `singleton`.",
+			},
+			"set_command": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "Override for the update verb (default `set<suffix>`). os-acme uses `update` " +
+					"where the rest of OPNsense uses `set`; set `set_command = \"update\"` for those controllers.",
 			},
 			"envelope": schema.StringAttribute{
 				Optional: true,
@@ -350,7 +379,7 @@ func (r *objectResource) Update(ctx context.Context, req resource.UpdateRequest,
 		setCmd = "set"
 		p = cmdPath(module, controller, "set", "")
 	} else {
-		setCmd = "set" + itemSuffix(m)
+		setCmd = setVerb(m)
 		p = cmdPath(module, controller, setCmd, m.UUID.ValueString())
 	}
 	raw, err := r.client.Post(p, payload)
@@ -401,7 +430,7 @@ func (r *objectResource) Delete(ctx context.Context, req resource.DeleteRequest,
 func (r *objectResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	// Import id is a slash-delimited address; trailing `|`-fields carry the
 	// operational hints (positional) so imported state matches config (→ 0-diff):
-	//   <module>/<controller>[/<uuid>][|<reconfigure>[|<item_suffix>[|<envelope>]]]
+	//   <module>/<controller>[/<uuid>][|<reconfigure>[|<item_suffix>[|<envelope>[|<set_command>]]]]
 	// A two-segment address (no uuid) is a singleton; three segments is a
 	// collection item. Plugin items (os-haproxy/os-acme) pass item_suffix +
 	// envelope, e.g. `haproxy/settings/<uuid>|haproxy/service/reconfigure|Server|server`.
@@ -414,7 +443,7 @@ func (r *objectResource) ImportState(ctx context.Context, req resource.ImportSta
 		}
 		return ""
 	}
-	reconf, itemSfx, envel := pipeField(1), pipeField(2), pipeField(3)
+	reconf, itemSfx, envel, setCmd := pipeField(1), pipeField(2), pipeField(3), pipeField(4)
 	segs := strings.Split(strings.Trim(idPart, "/"), "/")
 	if len(segs) < 2 || len(segs) > 3 {
 		resp.Diagnostics.AddError("Invalid import id",
@@ -444,6 +473,7 @@ func (r *objectResource) ImportState(ctx context.Context, req resource.ImportSta
 	}
 	setStrOrNull("reconfigure", reconf)
 	setStrOrNull("item_suffix", itemSfx)
+	setStrOrNull("set_command", setCmd)
 	setStrOrNull("envelope", envel)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("body"), "{}")...)
 }
