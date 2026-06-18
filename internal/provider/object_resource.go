@@ -196,8 +196,43 @@ func cmdPath(module, controller, command, uuid string) string {
 // wrap envelopes the declared body under the controller key, as OPNsense
 // addItem/setItem/set expect: {"<controller>": {...body}}.
 func wrap(controller string, body []byte) ([]byte, error) {
+	if controller == "alias" {
+		body = aliasContentToNewlines(body)
+	}
 	var inner json.RawMessage = body
 	return json.Marshal(map[string]json.RawMessage{controller: inner})
+}
+
+// aliasContentToNewlines rewrites a firewall alias `content` field from the
+// comma-joined form (how the declared body and the read-back OptionField are
+// normalized, so subsetMatches reaches 0-diff) to OPNsense's on-write form:
+// newline-separated entries. setItem validates the whole `content` string as a
+// single host/network otherwise ("…,… is not a valid hostname"). Read stays
+// comma (collapseOptionFields), so the round-trip remains 0-diff. No-op when
+// content is absent or contains no comma.
+func aliasContentToNewlines(body []byte) []byte {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	raw, ok := m["content"]
+	if !ok {
+		return body
+	}
+	var content string
+	if json.Unmarshal(raw, &content) != nil || !strings.Contains(content, ",") {
+		return body
+	}
+	nl, err := json.Marshal(strings.ReplaceAll(content, ",", "\n"))
+	if err != nil {
+		return body
+	}
+	m["content"] = nl
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // unwrap extracts the {"<controller>": {...}} envelope returned by

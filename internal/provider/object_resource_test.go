@@ -155,6 +155,37 @@ func TestWrap(t *testing.T) {
 	}
 }
 
+func TestAliasContentToNewlines(t *testing.T) {
+	// alias: multi-entry comma content is rewritten to newline-separated on write
+	// (OPNsense setItem validates the whole field as one host otherwise).
+	got, _ := wrap("alias", []byte(`{"name":"m","content":"a.com,b.com,c.com"}`))
+	var env map[string]map[string]string
+	if err := json.Unmarshal(got, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env["alias"]["content"] != "a.com\nb.com\nc.com" {
+		t.Fatalf("alias content = %q, want newline-separated", env["alias"]["content"])
+	}
+	// non-alias controller: content left untouched (commas are valid there).
+	got2, _ := wrap("rule", []byte(`{"content":"a,b"}`))
+	var env2 map[string]map[string]string
+	if err := json.Unmarshal(got2, &env2); err != nil {
+		t.Fatal(err)
+	}
+	if env2["rule"]["content"] != "a,b" {
+		t.Fatalf("non-alias content should be unchanged, got %q", env2["rule"]["content"])
+	}
+	// alias single entry (no comma): unchanged.
+	got3, _ := wrap("alias", []byte(`{"content":"only.com"}`))
+	var env3 map[string]map[string]string
+	if err := json.Unmarshal(got3, &env3); err != nil {
+		t.Fatal(err)
+	}
+	if env3["alias"]["content"] != "only.com" {
+		t.Fatalf("single-entry alias content changed: %q", env3["alias"]["content"])
+	}
+}
+
 func TestUnwrap(t *testing.T) {
 	cases := []struct {
 		name       string
