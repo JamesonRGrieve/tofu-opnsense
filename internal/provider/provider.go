@@ -8,6 +8,7 @@ package provider
 
 import (
 	"context"
+	"time"
 
 	"github.com/JamesonRGrieve/tofu-opnsense/internal/opnsense"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -33,6 +34,7 @@ type providerModel struct {
 	Key      types.String `tfsdk:"key"`
 	Secret   types.String `tfsdk:"secret"`
 	Insecure types.Bool   `tfsdk:"insecure"`
+	Timeout  types.Int64  `tfsdk:"timeout"`
 }
 
 func (p *opnsenseProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -66,6 +68,12 @@ func (p *opnsenseProvider) Schema(_ context.Context, _ provider.SchemaRequest, r
 				MarkdownDescription: "Skip TLS verification (default true — OPNsense ships a self-signed cert). " +
 					"Set false only with a trusted cert installed.",
 			},
+			"timeout": schema.Int64Attribute{
+				Optional: true,
+				MarkdownDescription: "Per-request HTTP timeout in seconds (default 30). Raise it for slow " +
+					"operations that reconfigure the interface subsystem synchronously (e.g. creating a VXLAN " +
+					"or bridge can exceed 30s on a box with many interfaces).",
+			},
 		},
 	}
 }
@@ -80,11 +88,16 @@ func (p *opnsenseProvider) Configure(ctx context.Context, req provider.Configure
 	if !cfg.Insecure.IsNull() && !cfg.Insecure.IsUnknown() {
 		insecure = cfg.Insecure.ValueBool()
 	}
+	var timeout time.Duration
+	if !cfg.Timeout.IsNull() && !cfg.Timeout.IsUnknown() && cfg.Timeout.ValueInt64() > 0 {
+		timeout = time.Duration(cfg.Timeout.ValueInt64()) * time.Second
+	}
 	client := opnsense.NewClient(opnsense.Config{
 		Host:     cfg.Host.ValueString(),
 		Key:      cfg.Key.ValueString(),
 		Secret:   cfg.Secret.ValueString(),
 		Insecure: insecure,
+		Timeout:  timeout, // 0 -> client default (30s)
 	})
 	resp.ResourceData = client
 	resp.DataSourceData = client
