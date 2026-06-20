@@ -130,9 +130,12 @@ func (c *SSHClient) runOnce(remote string, stdin []byte) ([]byte, error) {
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds(c.timeout)),
-		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=/tmp/opnsense-cm-%C",
-		"-o", "ControlPersist=20s",
+		// NO ControlMaster: the lab jump-host relay is a single-shot busybox `nc -e`
+		// pipe that one persistent multiplexed connection breaks. system_config makes
+		// only a read + an apply call (no per-key fan-out), so keepalives suffice —
+		// exactly the options the proven shell tier used against this relay.
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
 	}
 	if c.port != "" {
 		args = append(args, "-p", c.port)
