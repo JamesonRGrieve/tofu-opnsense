@@ -124,7 +124,11 @@ func (c *SSHClient) runOnce(remote string, stdin []byte) ([]byte, error) {
 
 	args := []string{
 		"-o", "BatchMode=yes",
+		// Relay-forwarded lab boxes present varying host keys and the runner's
+		// known_hosts may be unwritable — discard host-key state (matches the
+		// shell tier this replaced) so a key change never blocks the connection.
 		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeoutSeconds(c.timeout)),
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=/tmp/opnsense-cm-%C",
