@@ -120,6 +120,33 @@ func TestPhpQuote(t *testing.T) {
 	}
 }
 
+func TestBuildAllowUsersConf(t *testing.T) {
+	// connUser always present, even if not declared (no lockout).
+	if got := buildAllowUsersConf([]string{"admin"}, "root"); got != "AllowUsers admin root" {
+		t.Errorf("got %q", got)
+	}
+	// not duplicated when already declared.
+	if got := buildAllowUsersConf([]string{"root", "admin"}, "root"); got != "AllowUsers root admin" {
+		t.Errorf("got %q", got)
+	}
+	// empty users but a connUser → still guard the transport.
+	if got := buildAllowUsersConf(nil, "root"); got != "AllowUsers root" {
+		t.Errorf("got %q", got)
+	}
+	if got := buildAllowUsersConf(nil, ""); got != "" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestBuildTrapSink(t *testing.T) {
+	if got := buildTrapSink("10.0.0.1"); got != "trap2sink 10.0.0.1 public 162" {
+		t.Errorf("got %q", got)
+	}
+	if got := buildTrapSink("10.0.0.1:1162"); got != "trap2sink 10.0.0.1 public 1162" {
+		t.Errorf("got %q", got)
+	}
+}
+
 func TestLastJSONLine(t *testing.T) {
 	in := []byte("PHP Warning: something\n{\"hostname\":\"fw\"}\n")
 	if got := lastJSONLine(in); got != `{"hostname":"fw"}` {

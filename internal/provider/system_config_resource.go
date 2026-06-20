@@ -51,6 +51,8 @@ type systemConfigModel struct {
 	NTPServeLAN      types.Bool   `tfsdk:"ntp_serve_lan"`
 	Tunables         types.Map    `tfsdk:"tunables"`
 	LogRetentionDays types.Int64  `tfsdk:"log_retention_days"`
+	SSHAllowUsers    types.List   `tfsdk:"ssh_allow_users"`
+	SNMPTrapTarget   types.String `tfsdk:"snmp_trap_target"`
 }
 
 func (r *systemConfigResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -108,6 +110,15 @@ func (r *systemConfigResource) Schema(_ context.Context, _ resource.SchemaReques
 			"log_retention_days": schema.Int64Attribute{
 				Optional:            true,
 				MarkdownDescription: "Log retention in days (`config.OPNsense.Syslog.general.maxpreserve`); restarts syslog.",
+			},
+			"ssh_allow_users": schema.ListAttribute{
+				Optional:            true,
+				ElementType:         types.StringType,
+				MarkdownDescription: "sshd `AllowUsers` (drop-in `/usr/local/etc/ssh/sshd_config.d/allow_users.conf`; restarts sshd). The provider's own SSH user is always appended so it can never lock the provider out.",
+			},
+			"snmp_trap_target": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "net-snmp trap2sink target `host` or `host:port` (`snmpd.local.conf`; restarts netsnmp). Empty leaves it unmanaged.",
 			},
 		},
 	}
@@ -278,6 +289,63 @@ func (r *systemConfigResource) apply(ctx context.Context, m systemConfigModel, d
 			diags.AddError("OPNsense system_config syslog restart failed", err.Error())
 		}
 	}
+	// sshd AllowUsers — a config.xml-less drop-in file (no MVC API). Always include
+	// the provider's own SSH user so a bad list can't lock the transport out.
+	if !m.SSHAllowUsers.IsNull() {
+		conf := buildAllowUsersConf(listToStrings(ctx, m.SSHAllowUsers), r.client.SSH.User())
+		if conf != "" {
+			cmd := fmt.Sprintf("mkdir -p /usr/local/etc/ssh/sshd_config.d && printf '%%s\\n' %s > /usr/local/etc/ssh/sshd_config.d/allow_users.conf", shellArg(conf))
+			if _, err := r.client.SSH.Run(cmd, nil); err != nil {
+				diags.AddError("OPNsense system_config ssh AllowUsers write failed", err.Error())
+				return
+			}
+			_, _ = r.client.SSH.Run("/usr/local/sbin/configctl openssh restart", nil)
+		}
+	}
+	// SNMP trap2sink — net-snmp reads snmpd.local.conf; rewrite the tofu-managed
+	// block (marker-delimited, BSD sed) and restart netsnmp.
+	if !m.SNMPTrapTarget.IsNull() && m.SNMPTrapTarget.ValueString() != "" {
+		line := buildTrapSink(m.SNMPTrapTarget.ValueString())
+		cmd := fmt.Sprintf("touch /usr/local/share/snmp/snmpd.local.conf && "+
+			"sed -i '' '/^# tofu-managed-trap/,/^trap2sink/{/^# tofu-managed-trap/d;/^trap2sink/d;}' /usr/local/share/snmp/snmpd.local.conf && "+
+			"printf '%%s\\n' '# tofu-managed-trap' %s >> /usr/local/share/snmp/snmpd.local.conf", shellArg(line))
+		if _, err := r.client.SSH.Run(cmd, nil); err != nil {
+			diags.AddError("OPNsense system_config snmp trap2sink write failed", err.Error())
+			return
+		}
+		_, _ = r.client.SSH.Run("/usr/local/sbin/configctl netsnmp restart", nil)
+	}
+}
+
+// buildAllowUsersConf renders the sshd AllowUsers drop-in line, always including
+// connUser so the provider can never lock its own SSH transport out. Empty when
+// there are no users.
+func buildAllowUsersConf(users []string, connUser string) string {
+	all := append([]string{}, users...)
+	present := false
+	for _, u := range all {
+		if u == connUser {
+			present = true
+			break
+		}
+	}
+	if connUser != "" && !present {
+		all = append(all, connUser)
+	}
+	if len(all) == 0 {
+		return ""
+	}
+	return "AllowUsers " + strings.Join(all, " ")
+}
+
+// buildTrapSink renders a net-snmp trap2sink directive from a "host" or
+// "host:port" target (default port 162).
+func buildTrapSink(target string) string {
+	host, port := target, "162"
+	if i := strings.LastIndex(target, ":"); i > 0 {
+		host, port = target[:i], target[i+1:]
+	}
+	return "trap2sink " + host + " public " + port
 }
 
 // shellArg single-quotes a value for safe use in a remote shell command.

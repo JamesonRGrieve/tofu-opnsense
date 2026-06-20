@@ -51,6 +51,10 @@ type SSHClient struct {
 }
 
 // NewSSHClient builds an SSHClient. It does not contact the host until first use.
+// User returns the SSH login user (so a resource managing sshd AllowUsers can keep
+// the provider's own access from being locked out).
+func (c *SSHClient) User() string { return c.user }
+
 func NewSSHClient(c SSHConfig) *SSHClient {
 	if c.Timeout == 0 {
 		c.Timeout = 45 * time.Second
