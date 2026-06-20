@@ -246,13 +246,22 @@ func (r *ifaceAssignResource) applyAssign(_ context.Context, m *ifaceAssignModel
 	}
 }
 
+// ifacePHPPreamble opens every interface-PHP script: route errors to stderr (so a
+// fatal is diagnosable over SSH rather than a bare exit 255) AND prepend OPNsense's
+// include dir to the path — php reading the script from stdin does NOT inherit it,
+// so require_once("config.inc"/"interfaces.inc") would 'Failed to open stream'.
+// config.inc is the canonical OPNsense bootstrap (it pulls in the globals); a
+// standalone globals.inc does not exist on current OPNsense, so we never require it.
+const ifacePHPPreamble = "<?php\nini_set('display_errors','stderr');\nerror_reporting(E_ALL);\n" +
+	"set_include_path('/usr/local/etc/inc' . PATH_SEPARATOR . get_include_path());\n"
+
 // buildIfaceApplyPHP reproduces the shell vlan_interface create logic: resolve the
 // section (by device, then descr, then positional), set the interface fields, write
 // config, and apply ONLY that interface. Pure for testability.
 func buildIfaceApplyPHP(m ifaceAssignModel) string {
 	var b strings.Builder
-	b.WriteString("<?php\nini_set('display_errors','stderr');\nerror_reporting(E_ALL);\n")
-	b.WriteString("require_once(\"globals.inc\");\nrequire_once(\"config.inc\");\nrequire_once(\"util.inc\");\nrequire_once(\"interfaces.inc\");\n")
+	b.WriteString(ifacePHPPreamble)
+	b.WriteString("require_once(\"config.inc\");\nrequire_once(\"util.inc\");\nrequire_once(\"interfaces.inc\");\n")
 	b.WriteString("global $config;\n$config = parse_config(true);\n")
 	b.WriteString("if (!isset($config[\"interfaces\"])) { $config[\"interfaces\"] = array(); }\n")
 	fmt.Fprintf(&b, "$ts = '%s';\n", phpQuote(m.Section.ValueString()))
@@ -283,7 +292,8 @@ echo "\n";
 // buildIfaceReadPHP reproduces the shell vlan_interface read logic.
 func buildIfaceReadPHP(m ifaceAssignModel) string {
 	var b strings.Builder
-	b.WriteString("<?php\nini_set('display_errors','stderr');\nrequire_once(\"config.inc\");\n")
+	b.WriteString(ifacePHPPreamble)
+	b.WriteString("require_once(\"config.inc\");\n")
 	b.WriteString("$config = parse_config(true);\n$ifs = $config[\"interfaces\"] ?? array();\n")
 	fmt.Fprintf(&b, "$ts = '%s'; $tif = '%s'; $td = '%s';\n",
 		phpQuote(m.Section.ValueString()), phpQuote(m.Device.ValueString()), phpQuote(m.Description.ValueString()))
@@ -302,8 +312,8 @@ echo "\n";
 // teardown of ONLY this section (bring down, unset, write) — never the whole box.
 func buildIfaceDeletePHP(section string) string {
 	var b strings.Builder
-	b.WriteString("<?php\nini_set('display_errors','stderr');\n")
-	b.WriteString("require_once(\"globals.inc\");\nrequire_once(\"config.inc\");\nrequire_once(\"util.inc\");\nrequire_once(\"interfaces.inc\");\n")
+	b.WriteString(ifacePHPPreamble)
+	b.WriteString("require_once(\"config.inc\");\nrequire_once(\"util.inc\");\nrequire_once(\"interfaces.inc\");\n")
 	b.WriteString("global $config;\n$config = parse_config(true);\n")
 	fmt.Fprintf(&b, "$section = '%s';\n", phpQuote(section))
 	b.WriteString(`if (isset($config["interfaces"][$section])) { interface_bring_down($section); unset($config["interfaces"][$section]); write_config("opnsense_interface_assignment removed by OpenTofu"); }
