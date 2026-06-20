@@ -77,6 +77,35 @@ func TestBuildApplyPHP_DNSAndNTP(t *testing.T) {
 	}
 }
 
+func TestBuildApplyPHP_TunablesAndLogRetention(t *testing.T) {
+	ctx := context.Background()
+	tun := types.MapValueMust(
+		types.ObjectType{AttrTypes: map[string]attr.Type{"value": types.StringType, "description": types.StringType}},
+		map[string]attr.Value{
+			"net.inet.ip.forwarding": types.ObjectValueMust(
+				map[string]attr.Type{"value": types.StringType, "description": types.StringType},
+				map[string]attr.Value{"value": types.StringValue("1"), "description": types.StringValue("IP forwarding")},
+			),
+		},
+	)
+	m := systemConfigModel{
+		Hostname: types.StringNull(), Domain: types.StringNull(), Timezone: types.StringNull(),
+		DNSServers: types.ListNull(types.StringType), NTPServers: types.ListNull(types.StringType),
+		NTPServeLAN: types.BoolNull(), Tunables: tun, LogRetentionDays: types.Int64Value(30),
+	}
+	php := buildApplyPHP(ctx, m)
+	for _, want := range []string{
+		"function _tofu_sysctl(",
+		"_tofu_sysctl($config, 'net.inet.ip.forwarding', '1', 'IP forwarding');",
+		`$config["OPNsense"]["Syslog"]["general"]["maxpreserve"] = '30';`,
+		"write_config(",
+	} {
+		if !strings.Contains(php, want) {
+			t.Errorf("apply PHP missing %q\n--- php ---\n%s", want, php)
+		}
+	}
+}
+
 func TestPhpQuote(t *testing.T) {
 	cases := map[string]string{
 		"plain": "plain",

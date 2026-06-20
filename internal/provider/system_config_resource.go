@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/JamesonRGrieve/tofu-opnsense/internal/opnsense"
@@ -41,13 +42,15 @@ type systemConfigResource struct {
 }
 
 type systemConfigModel struct {
-	ID          types.String `tfsdk:"id"`
-	Hostname    types.String `tfsdk:"hostname"`
-	Domain      types.String `tfsdk:"domain"`
-	Timezone    types.String `tfsdk:"timezone"`
-	DNSServers  types.List   `tfsdk:"dns_servers"`
-	NTPServers  types.List   `tfsdk:"ntp_servers"`
-	NTPServeLAN types.Bool   `tfsdk:"ntp_serve_lan"`
+	ID               types.String `tfsdk:"id"`
+	Hostname         types.String `tfsdk:"hostname"`
+	Domain           types.String `tfsdk:"domain"`
+	Timezone         types.String `tfsdk:"timezone"`
+	DNSServers       types.List   `tfsdk:"dns_servers"`
+	NTPServers       types.List   `tfsdk:"ntp_servers"`
+	NTPServeLAN      types.Bool   `tfsdk:"ntp_serve_lan"`
+	Tunables         types.Map    `tfsdk:"tunables"`
+	LogRetentionDays types.Int64  `tfsdk:"log_retention_days"`
 }
 
 func (r *systemConfigResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -91,6 +94,20 @@ func (r *systemConfigResource) Schema(_ context.Context, _ resource.SchemaReques
 			"ntp_serve_lan": schema.BoolAttribute{
 				Optional:            true,
 				MarkdownDescription: "Serve NTP to the LAN interface (`ntpd.interface = lan`).",
+			},
+			"tunables": schema.MapNestedAttribute{
+				Optional:            true,
+				MarkdownDescription: "System tunables (`config.sysctl.item[]`), keyed by tunable name. Each is upserted and applied live with `sysctl`.",
+				NestedObject: schema.NestedAttributeObject{
+					Attributes: map[string]schema.Attribute{
+						"value":       schema.StringAttribute{Required: true, MarkdownDescription: "Tunable value."},
+						"description": schema.StringAttribute{Optional: true, MarkdownDescription: "Tunable description."},
+					},
+				},
+			},
+			"log_retention_days": schema.Int64Attribute{
+				Optional:            true,
+				MarkdownDescription: "Log retention in days (`config.OPNsense.Syslog.general.maxpreserve`); restarts syslog.",
 			},
 		},
 	}
@@ -249,6 +266,23 @@ func (r *systemConfigResource) apply(ctx context.Context, m systemConfigModel, d
 			diags.AddError("OPNsense system_config ntpd restart failed", err.Error())
 		}
 	}
+	// Apply tunables live (write_config persists; boot-only tunables ignore the live
+	// set harmlessly). One `sysctl k=v` per declared tunable.
+	for _, t := range sortedKeys(tunablesToMap(ctx, m.Tunables)) {
+		tv := tunablesToMap(ctx, m.Tunables)[t]
+		_, _ = r.client.SSH.Run(fmt.Sprintf("sysctl %s=%s", shellArg(t), shellArg(tv.value)), nil)
+	}
+	// Log retention is a syslog-ng setting — restart syslog to apply maxpreserve.
+	if !m.LogRetentionDays.IsNull() {
+		if _, err := r.client.SSH.Run("/usr/local/sbin/configctl syslog restart", nil); err != nil {
+			diags.AddError("OPNsense system_config syslog restart failed", err.Error())
+		}
+	}
+}
+
+// shellArg single-quotes a value for safe use in a remote shell command.
+func shellArg(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // buildApplyPHP renders the PHP that sets the declared keys, writes config, and
@@ -307,6 +341,25 @@ func buildApplyPHP(ctx context.Context, m systemConfigModel) string {
 		}
 	}
 
+	// Tunables (config.sysctl.item[]) — upsert each by tunable name (via the
+	// _tofu_sysctl helper defined in the preamble). The live `sysctl` set is done
+	// in apply() (boot-only tunables ignore it harmlessly).
+	tunables := tunablesToMap(ctx, m.Tunables)
+	if len(tunables) > 0 {
+		b.WriteString("config_read_array(\"sysctl\", \"item\");\n")
+		b.WriteString("function _tofu_sysctl(&$config,$t,$v,$d){ if(!isset($config[\"sysctl\"][\"item\"])||!is_array($config[\"sysctl\"][\"item\"]))$config[\"sysctl\"][\"item\"]=array(); $f=false; foreach($config[\"sysctl\"][\"item\"] as &$it){ if(($it[\"tunable\"]??\"\")===$t){$it[\"value\"]=$v;$it[\"descr\"]=$d;$f=true;break;} } unset($it); if(!$f)$config[\"sysctl\"][\"item\"][]=array(\"tunable\"=>$t,\"value\"=>$v,\"descr\"=>$d); }\n")
+		for _, t := range sortedKeys(tunables) {
+			fmt.Fprintf(&b, "_tofu_sysctl($config, '%s', '%s', '%s');\n",
+				phpQuote(t), phpQuote(tunables[t].value), phpQuote(tunables[t].description))
+		}
+	}
+	// Log retention (config.OPNsense.Syslog.general.maxpreserve).
+	if !m.LogRetentionDays.IsNull() {
+		b.WriteString("config_read_array(\"OPNsense\", \"Syslog\", \"general\");\n")
+		fmt.Fprintf(&b, "$config[\"OPNsense\"][\"Syslog\"][\"general\"][\"maxpreserve\"] = '%d';\n", m.LogRetentionDays.ValueInt64())
+	}
+
+	// One write_config after all sets, then the matching configure functions.
 	b.WriteString("write_config(\"opnsense_system_config (managed by OpenTofu)\");\n")
 	if doHostname || doDomain {
 		// system_hostname_configure requires its $verbose arg (the shell tier this
@@ -319,8 +372,6 @@ func buildApplyPHP(ctx context.Context, m systemConfigModel) string {
 	if doDNS || doDomain {
 		b.WriteString("if (function_exists('system_resolvconf_generate')) system_resolvconf_generate();\n")
 	}
-	// (NTP daemon restart is done by apply() via a separate `configctl` SSH call —
-	// mwexec() is not loaded in this php require set.)
 	b.WriteString("echo \"OK\\n\";\n")
 	return b.String()
 }
@@ -360,4 +411,34 @@ func listToStrings(ctx context.Context, l types.List) []string {
 	}
 	_ = l.ElementsAs(ctx, &out, false)
 	return out
+}
+
+type tunableVal struct {
+	Value       types.String `tfsdk:"value"`
+	Description types.String `tfsdk:"description"`
+}
+
+// tunablesToMap flattens the tunables map attribute to name -> {value, description}.
+func tunablesToMap(ctx context.Context, m types.Map) map[string]struct{ value, description string } {
+	out := map[string]struct{ value, description string }{}
+	if m.IsNull() || m.IsUnknown() {
+		return out
+	}
+	elems := map[string]tunableVal{}
+	if d := m.ElementsAs(ctx, &elems, false); d.HasError() {
+		return out
+	}
+	for k, v := range elems {
+		out[k] = struct{ value, description string }{value: v.Value.ValueString(), description: v.Description.ValueString()}
+	}
+	return out
+}
+
+func sortedKeys(m map[string]struct{ value, description string }) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
