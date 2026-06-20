@@ -35,6 +35,13 @@ type providerModel struct {
 	Secret   types.String `tfsdk:"secret"`
 	Insecure types.Bool   `tfsdk:"insecure"`
 	Timeout  types.Int64  `tfsdk:"timeout"`
+	// SSH transport (optional) — only for opnsense_system_config, which manages the
+	// config.xml <system> settings that have no REST API. Unset → that resource errors.
+	SSHHost    types.String `tfsdk:"ssh_host"`
+	SSHPort    types.Int64  `tfsdk:"ssh_port"`
+	SSHUser    types.String `tfsdk:"ssh_user"`
+	SSHKeyFile types.String `tfsdk:"ssh_key_file"`
+	SSHKeyPEM  types.String `tfsdk:"ssh_key_pem"`
 }
 
 func (p *opnsenseProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -74,6 +81,31 @@ func (p *opnsenseProvider) Schema(_ context.Context, _ provider.SchemaRequest, r
 					"operations that reconfigure the interface subsystem synchronously (e.g. creating a VXLAN " +
 					"or bridge can exceed 30s on a box with many interfaces).",
 			},
+			"ssh_host": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "SSH address (host or host:port) for `opnsense_system_config` only — the " +
+					"config.xml `<system>` settings (hostname/domain/timezone/DNS/NTP) have no REST API and are " +
+					"applied via the PHP config framework over SSH. OPNsense often binds sshd to a different " +
+					"interface/port than the API, so this is separate from `host`. Omit to disable that resource.",
+			},
+			"ssh_port": schema.Int64Attribute{
+				Optional:            true,
+				MarkdownDescription: "SSH port (default: the port in `ssh_host`, else 22).",
+			},
+			"ssh_user": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "SSH user (default `root`).",
+			},
+			"ssh_key_file": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "Path to an SSH identity file (`ssh -i`). When empty, ssh_config/agent is used.",
+			},
+			"ssh_key_pem": schema.StringAttribute{
+				Optional:  true,
+				Sensitive: true,
+				MarkdownDescription: "SSH private-key material (e.g. an OpenBao-signed key). Materialized to a temp " +
+					"0600 file per call; available at plan time, unlike a Terraform-written key file.",
+			},
 		},
 	}
 }
@@ -99,12 +131,24 @@ func (p *opnsenseProvider) Configure(ctx context.Context, req provider.Configure
 		Insecure: insecure,
 		Timeout:  timeout, // 0 -> client default (30s)
 	})
+	// Optional SSH transport — only wired when ssh_host is set. Powers
+	// opnsense_system_config (the config.xml <system> tail has no REST API).
+	if !cfg.SSHHost.IsNull() && cfg.SSHHost.ValueString() != "" {
+		client.SSH = opnsense.NewSSHClient(opnsense.SSHConfig{
+			Host:    cfg.SSHHost.ValueString(),
+			Port:    int(cfg.SSHPort.ValueInt64()),
+			User:    cfg.SSHUser.ValueString(),
+			KeyFile: cfg.SSHKeyFile.ValueString(),
+			KeyPEM:  cfg.SSHKeyPEM.ValueString(),
+			Timeout: timeout,
+		})
+	}
 	resp.ResourceData = client
 	resp.DataSourceData = client
 }
 
 func (p *opnsenseProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewObjectResource, NewReconcileResource}
+	return []func() resource.Resource{NewObjectResource, NewReconcileResource, NewSystemConfigResource}
 }
 
 func (p *opnsenseProvider) DataSources(_ context.Context) []func() datasource.DataSource {

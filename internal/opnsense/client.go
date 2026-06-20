@@ -31,6 +31,10 @@ type Client struct {
 	base string // e.g. https://192.168.7.9/api
 	auth string // "Basic <base64(key:secret)>"
 	http *http.Client
+	// SSH is an optional transport for the config.xml <system> settings that have
+	// NO REST API (hostname/domain/timezone/DNS/NTP) — see ssh.go. nil when the
+	// provider was configured without SSH; opnsense_system_config requires it.
+	SSH *SSHClient
 }
 
 // Config configures a Client.
