@@ -239,6 +239,15 @@ func (r *systemConfigResource) apply(ctx context.Context, m systemConfigModel, d
 	}
 	if _, err := r.client.SSH.Run("/usr/local/bin/php", []byte(buildApplyPHP(ctx, m))); err != nil {
 		diags.AddError("OPNsense system_config apply failed", err.Error())
+		return
+	}
+	// NTP has no system_*_configure() in core, so restart the daemon via configctl
+	// as a plain shell command (the shell tier did the same — mwexec() is not
+	// available in this php require set, and an undefined-function call is a fatal).
+	if !m.NTPServers.IsNull() {
+		if _, err := r.client.SSH.Run("/usr/local/sbin/configctl ntpd restart", nil); err != nil {
+			diags.AddError("OPNsense system_config ntpd restart failed", err.Error())
+		}
 	}
 }
 
@@ -310,10 +319,8 @@ func buildApplyPHP(ctx context.Context, m systemConfigModel) string {
 	if doDNS || doDomain {
 		b.WriteString("if (function_exists('system_resolvconf_generate')) system_resolvconf_generate();\n")
 	}
-	if doNTP {
-		// NTP has no system_*_configure() in core; configctl restarts the daemon.
-		b.WriteString("@mwexec('/usr/local/sbin/configctl ntpd restart');\n")
-	}
+	// (NTP daemon restart is done by apply() via a separate `configctl` SSH call —
+	// mwexec() is not loaded in this php require set.)
 	b.WriteString("echo \"OK\\n\";\n")
 	return b.String()
 }

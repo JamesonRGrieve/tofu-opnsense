@@ -65,7 +65,6 @@ func TestBuildApplyPHP_DNSAndNTP(t *testing.T) {
 		`$config["system"]["timeservers"] = '100.64.92.1 pool.ntp.org';`,
 		`$config["ntpd"]["prefer"] = '100.64.92.1';`,
 		`$config["ntpd"]["interface"] = 'lan';`,
-		"configctl ntpd restart",
 		"system_resolvconf_generate()",
 	} {
 		if !strings.Contains(php, want) {
