@@ -25,29 +25,28 @@ func TestBuildIfaceApplyPHP(t *testing.T) {
 		"$td = 'IAC_EXERCISE';",
 		"$tip = '203.0.113.241';",
 		`$iface["if"] = $tif;`,
-		"interface_configure(false, $rs);", // SAFETY: single-interface, never whole-box
 		`write_config(`,
 	} {
 		if !strings.Contains(php, want) {
 			t.Errorf("apply PHP missing %q\n--- php ---\n%s", want, php)
 		}
 	}
-	// MUST NOT bounce every interface (the 2026-06-04 outage).
-	if strings.Contains(php, "interfaces_configure(") {
-		t.Errorf("apply PHP must never call interfaces_configure() (whole-box bounce)\n%s", php)
+	// The realize step is configctl (in applyAssign), NOT a framework call in PHP
+	// (interface_configure fatals on a missing include from a bare stdin php), and
+	// MUST NEVER bounce every interface (the 2026-06-04 outage).
+	if strings.Contains(php, "interface_configure(") || strings.Contains(php, "interfaces_configure(") {
+		t.Errorf("apply PHP must not call interface(s)_configure() — realize via configctl\n%s", php)
 	}
 }
 
 func TestBuildIfaceDeletePHP_TargetedTeardown(t *testing.T) {
 	php := buildIfaceDeletePHP("opt2")
-	if !strings.Contains(php, "interface_bring_down($section)") {
-		t.Errorf("delete PHP must bring down only the one section\n%s", php)
-	}
 	if !strings.Contains(php, `unset($config["interfaces"][$section])`) {
 		t.Errorf("delete PHP must unset the section\n%s", php)
 	}
-	if strings.Contains(php, "interfaces_configure(") {
-		t.Errorf("delete PHP must never call interfaces_configure()\n%s", php)
+	// Teardown is configctl interface stop (in Delete), never a whole-box reconfigure.
+	if strings.Contains(php, "interface_configure(") || strings.Contains(php, "interfaces_configure(") {
+		t.Errorf("delete PHP must not call interface(s)_configure()\n%s", php)
 	}
 }
 

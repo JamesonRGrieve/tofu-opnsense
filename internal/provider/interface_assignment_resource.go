@@ -213,6 +213,12 @@ func (r *ifaceAssignResource) Delete(ctx context.Context, req resource.DeleteReq
 	if section == "" {
 		return
 	}
+	// Bring the interface down first (in configd context), THEN remove it from
+	// config — mirroring the OPNsense GUI delete order, but without the framework
+	// interface_bring_down() (which has the same missing-include fatal as
+	// interface_configure). `configctl interface stop <section>` runs in the full
+	// context; best-effort (a never-up section is harmless to "stop").
+	_, _ = r.client.SSH.Run("/usr/local/sbin/configctl interface stop "+shellArg(section), nil)
 	if _, err := r.client.SSH.Run("/usr/local/bin/php", []byte(buildIfaceDeletePHP(section))); err != nil {
 		resp.Diagnostics.AddError("OPNsense interface_assignment delete failed", err.Error())
 	}
@@ -238,11 +244,17 @@ func (r *ifaceAssignResource) applyAssign(_ context.Context, m *ifaceAssignModel
 		return
 	}
 	var dev deviceIface
+	section := m.Section.ValueString()
 	if e := json.Unmarshal([]byte(lastJSONLine(out)), &dev); e == nil && dev.Section != "" {
+		section = dev.Section
 		m.ID = types.StringValue(dev.Section)
 		m.Section = types.StringValue(dev.Section)
 	} else {
 		m.ID = m.Section
+	}
+	// Realize ONLY this interface in the full configd context (see buildIfaceApplyPHP).
+	if _, err := r.client.SSH.Run("/usr/local/sbin/configctl interface reconfigure "+shellArg(section), nil); err != nil {
+		diags.AddError("OPNsense interface_assignment reconfigure failed", err.Error())
 	}
 }
 
@@ -282,10 +294,15 @@ $iface["ipaddr"] = $tip; $iface["subnet"] = $tpfx; $iface["gateway"] = "";
 if ($tip6 !== "") { $iface["ipaddrv6"] = $tip6; $iface["subnetv6"] = $tpfx6; } else { $iface["ipaddrv6"] = ""; $iface["subnetv6"] = ""; }
 $iface["gatewayv6"] = "";
 write_config("opnsense_interface_assignment (managed by OpenTofu)");
-interface_configure(false, $rs);
 echo json_encode(array("section"=>$rs,"device"=>$tif,"descr"=>$td,"ipv4"=>$tip,"prefix4"=>$tpfx,"ipv6"=>$tip6,"prefix6"=>$tpfx6), JSON_UNESCAPED_SLASHES);
 echo "\n";
 `)
+	// NOTE: the interface is realized by applyAssign() via `configctl interface
+	// reconfigure <section>` — NOT interface_configure() in this PHP. A bare stdin
+	// php has config.inc/util.inc/interfaces.inc but not the plugin/filter includes
+	// interface_configure() transitively needs (it fatals on an undefined function
+	// from interfaces.inc). configctl runs the reconfigure in the full configd
+	// context, and reconfigures ONLY this section (never the whole-box bounce).
 	return b.String()
 }
 
@@ -316,7 +333,9 @@ func buildIfaceDeletePHP(section string) string {
 	b.WriteString("require_once(\"config.inc\");\nrequire_once(\"util.inc\");\nrequire_once(\"interfaces.inc\");\n")
 	b.WriteString("global $config;\n$config = parse_config(true);\n")
 	fmt.Fprintf(&b, "$section = '%s';\n", phpQuote(section))
-	b.WriteString(`if (isset($config["interfaces"][$section])) { interface_bring_down($section); unset($config["interfaces"][$section]); write_config("opnsense_interface_assignment removed by OpenTofu"); }
+	// The interface is brought down by Delete() via `configctl interface stop`
+	// BEFORE this runs; here we only remove it from config + persist.
+	b.WriteString(`if (isset($config["interfaces"][$section])) { unset($config["interfaces"][$section]); write_config("opnsense_interface_assignment removed by OpenTofu"); }
 echo "OK\n";
 `)
 	return b.String()
