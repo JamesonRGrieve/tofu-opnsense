@@ -34,7 +34,7 @@ func TestBuildApplyPHP_OnlyDeclaredKeys(t *testing.T) {
 	for _, want := range []string{
 		`$config["system"]["hostname"] = 'fw-lab';`,
 		`$config["system"]["timezone"] = 'America/Vancouver';`,
-		"system_hostname_configure()",
+		"system_hostname_configure(true)",
 		"system_timezone_configure()",
 		`write_config(`,
 	} {

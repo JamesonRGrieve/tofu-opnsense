@@ -249,6 +249,10 @@ func (r *systemConfigResource) apply(ctx context.Context, m systemConfigModel, d
 func buildApplyPHP(ctx context.Context, m systemConfigModel) string {
 	var b strings.Builder
 	b.WriteString("<?php\n")
+	// Surface runtime PHP errors on stderr so a fatal is diagnosable via SSH
+	// (OPNsense CLI php has display_errors off by default → a fatal would just
+	// exit 255 with nothing on the wire).
+	b.WriteString("ini_set('display_errors', 'stderr');\nerror_reporting(E_ALL);\n")
 	b.WriteString("require_once(\"config.inc\");\n")
 	b.WriteString("require_once(\"util.inc\");\n")
 	b.WriteString("require_once(\"system.inc\");\n")
@@ -296,7 +300,9 @@ func buildApplyPHP(ctx context.Context, m systemConfigModel) string {
 
 	b.WriteString("write_config(\"opnsense_system_config (managed by OpenTofu)\");\n")
 	if doHostname || doDomain {
-		b.WriteString("if (function_exists('system_hostname_configure')) system_hostname_configure();\n")
+		// system_hostname_configure requires its $verbose arg (the shell tier this
+		// replaced called it as system_hostname_configure(true)).
+		b.WriteString("if (function_exists('system_hostname_configure')) system_hostname_configure(true);\n")
 	}
 	if doTZ {
 		b.WriteString("if (function_exists('system_timezone_configure')) system_timezone_configure();\n")
@@ -314,6 +320,7 @@ func buildApplyPHP(ctx context.Context, m systemConfigModel) string {
 
 // readPHP echoes the managed <system> settings as one JSON object.
 const readPHP = `<?php
+ini_set('display_errors', 'stderr');
 require_once("config.inc");
 config_read_array("system");
 $ds = array();
