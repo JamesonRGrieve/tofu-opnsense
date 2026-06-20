@@ -148,7 +148,7 @@ func (p *opnsenseProvider) Configure(ctx context.Context, req provider.Configure
 }
 
 func (p *opnsenseProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{NewObjectResource, NewReconcileResource, NewSystemConfigResource}
+	return []func() resource.Resource{NewObjectResource, NewReconcileResource, NewSystemConfigResource, NewInterfaceAssignmentResource}
 }
 
 func (p *opnsenseProvider) DataSources(_ context.Context) []func() datasource.DataSource {
